@@ -7,3 +7,4 @@
 //! (for SQLite) live database introspection.
 
 pub mod db;
+pub mod document;
