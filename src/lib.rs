@@ -6,6 +6,7 @@
 //! documents, backed by a schema index built from the project's migrations and
 //! (for SQLite) live database introspection.
 
+pub mod analysis;
 pub mod db;
 pub mod document;
 pub mod introspect;

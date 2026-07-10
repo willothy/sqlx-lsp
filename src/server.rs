@@ -9,11 +9,14 @@ use tower_lsp::lsp_types::{
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern,
     InitializeParams, InitializeResult, InitializedParams, MessageType, Registration,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, Url, WorkDoneProgressOptions,
 };
 use tower_lsp::{Client, LanguageServer, jsonrpc};
 
+use crate::analysis::semantic_tokens;
 use crate::db::{DatabaseKind, Detection};
 use crate::document::Document;
 use crate::introspect::{self, SqliteDatabase};
@@ -228,6 +231,16 @@ impl LanguageServer for Backend {
                         ..TextDocumentSyncOptions::default()
                     },
                 )),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: WorkDoneProgressOptions::default(),
+                            legend: semantic_tokens::legend(),
+                            range: None,
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    ),
+                ),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -300,6 +313,21 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.remove(&params.text_document.uri);
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
+        let Some(document) = self.documents.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let kind = self.workspace.read().await.kind;
+        let data = semantic_tokens::semantic_tokens(&document, kind);
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {

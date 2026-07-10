@@ -129,6 +129,18 @@ impl Document {
         Some(Range { start, end })
     }
 
+    /// The UTF-16 length of a 0-based line, excluding its trailing newline.
+    /// Returns 0 for lines past the end of the document.
+    pub fn line_utf16_len(&self, line: u32) -> u32 {
+        let Some((start, end)) = self.line_span(line as usize) else {
+            return 0;
+        };
+        self.text[start..end]
+            .chars()
+            .map(|ch| ch.len_utf16() as u32)
+            .sum()
+    }
+
     /// Whether the LSP `position` falls inside the sqlparser `span`
     /// (start inclusive, end exclusive).
     pub fn position_in_span(&self, position: Position, span: SqlSpan) -> bool {
