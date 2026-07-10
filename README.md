@@ -52,8 +52,12 @@ live introspection for them is not implemented yet.
 
 ## Installation
 
+Prebuilt binaries for Linux (gnu/musl), macOS, and Windows are attached to
+the [GitHub releases](https://github.com/willothy/sqlx-lsp/releases) — the
+rolling `nightly` prerelease tracks `main`. Or build from source:
+
 ```sh
-cargo install --path .
+cargo install --git https://github.com/willothy/sqlx-lsp
 ```
 
 ## Editor setup
@@ -73,6 +77,14 @@ vim.lsp.config("sqlx_lsp", {
 })
 vim.lsp.enable("sqlx_lsp")
 ```
+
+VS Code: install `sqlx-lsp.vsix` from the
+[releases page](https://github.com/willothy/sqlx-lsp/releases) with
+`code --install-extension sqlx-lsp.vsix`. The extension lives in
+[`editors/vscode`](editors/vscode) and adds a TextMate injection grammar for
+SQL coloring inside the query macros (VS Code takes semantic tokens from
+only one provider per document, and rust-analyzer claims Rust files). Set
+`sqlx-lsp.serverPath` if the binary is not on `PATH`.
 
 Logging goes to stderr; set `SQLX_LSP_LOG` (a `tracing` filter, e.g. `debug`)
 to adjust verbosity. Schema loading progress is also reported through
