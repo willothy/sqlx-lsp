@@ -33,6 +33,16 @@ index from your migrations, and serves editor features against that schema.
   AST overlay that classifies tables, columns, aliases, and function names —
   including identifiers whose names collide with keywords.
 
+- **Rust buffers** — all of the above also work *inside* sqlx's query macros
+  in Rust files. Tree-sitter locates the SQL string of `query!`, `query_as!`,
+  `query_scalar!` (and their `_unchecked` variants, bare or
+  `sqlx::`-qualified), and the features run on the embedded SQL with results
+  mapped back to Rust buffer coordinates. Semantic tokens cover only the SQL
+  strings, layering cleanly on top of rust-analyzer's highlighting. Raw
+  strings (`r#"..."#`) are handled losslessly; plain strings are read
+  verbatim, without decoding escape sequences. `query_file!` is intentionally
+  not handled here — the referenced `.sql` file is served directly.
+
 The schema index reloads automatically when migrations, `Cargo.toml`, or
 `.env` change (via client file watching, with a save-based fallback).
 
@@ -49,14 +59,16 @@ cargo install --path .
 ## Editor setup
 
 The server speaks LSP over stdio. Point your editor's LSP client at the
-`sqlx-lsp` binary for SQL files, with the Rust project as the workspace root.
+`sqlx-lsp` binary for SQL files — and for Rust files too if you want
+features inside the query macros; the server runs happily alongside
+rust-analyzer and only answers for the embedded SQL.
 
 Neovim (0.11+):
 
 ```lua
 vim.lsp.config("sqlx_lsp", {
   cmd = { "sqlx-lsp" },
-  filetypes = { "sql" },
+  filetypes = { "sql", "rust" },
   root_markers = { "Cargo.toml" },
 })
 vim.lsp.enable("sqlx_lsp")
@@ -84,5 +96,6 @@ cargo clippy --all-targets
 
 The crate is a thin binary over a library (`src/lib.rs`); the interesting
 modules are `db` (backend detection), `schema` (migration replay and the
-schema index), `introspect` (read-only SQLite introspection), and
-`analysis/*` (the four language features).
+schema index), `introspect` (read-only SQLite introspection), `analysis/*`
+(the four language features), and `embedded` (tree-sitter extraction of SQL
+from Rust query macros).
