@@ -209,11 +209,8 @@ impl<'a> Cursor<'a> {
             // Consume `table [AS] [alias]` groups, continuing over commas
             // for `FROM a, b` lists.
             let mut next = index + 1;
-            loop {
-                let Some(table) = word_at(next).filter(|word| word.keyword == Keyword::NoKeyword)
-                else {
-                    break;
-                };
+            while let Some(table) = word_at(next).filter(|word| word.keyword == Keyword::NoKeyword)
+            {
                 let table_name = table.value.to_ascii_lowercase();
                 scope.insert(table_name.clone(), table_name.clone());
                 next += 1;
