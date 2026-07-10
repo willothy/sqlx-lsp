@@ -1,0 +1,55 @@
+{
+  "name": "sqlx-lsp",
+  "displayName": "sqlx LSP",
+  "description": "SQL language features for sqlx projects: completion, hover, goto definition, and highlighting for .sql files and sqlx query macros in Rust.",
+  "version": "0.1.0",
+  "publisher": "willothy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/willothy/sqlx-lsp"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:sql",
+    "onLanguage:rust"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "sqlx LSP",
+      "properties": {
+        "sqlx-lsp.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the sqlx-lsp executable. When empty, `sqlx-lsp` is resolved from PATH."
+        }
+      }
+    },
+    "grammars": [
+      {
+        "scopeName": "sqlx-sql.injection",
+        "path": "./syntaxes/sqlx-sql.injection.tmLanguage.json",
+        "injectTo": [
+          "source.rust"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.sql": "sql"
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "package": "vsce package --skip-license -o sqlx-lsp.vsix"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0"
+  }
+}

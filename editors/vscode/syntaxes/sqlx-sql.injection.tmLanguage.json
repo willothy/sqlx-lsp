@@ -1,0 +1,56 @@
+{
+  "scopeName": "sqlx-sql.injection",
+  "injectionSelector": "L:source.rust -comment -string",
+  "patterns": [
+    {
+      "include": "#sqlx-query-macro"
+    }
+  ],
+  "repository": {
+    "sqlx-query-macro": {
+      "comment": "SQL highlighting for the string argument of sqlx query macros. VS Code uses a single semantic-token provider per document (rust-analyzer wins in Rust files), so embedded SQL coloring comes from this TextMate injection instead.",
+      "begin": "\\b(?:sqlx\\s*::\\s*)?(query(?:_as|_scalar)?(?:_unchecked)?)\\s*!\\s*\\(",
+      "beginCaptures": {
+        "1": {
+          "name": "entity.name.function.macro.rust"
+        }
+      },
+      "end": "\\)",
+      "patterns": [
+        {
+          "include": "#raw-sql-string"
+        },
+        {
+          "include": "#sql-string"
+        }
+      ]
+    },
+    "raw-sql-string": {
+      "begin": "\\br(#*)\"",
+      "end": "\"\\1",
+      "name": "string.quoted.raw.rust",
+      "contentName": "meta.embedded.block.sql",
+      "patterns": [
+        {
+          "include": "source.sql"
+        }
+      ]
+    },
+    "sql-string": {
+      "begin": "\"",
+      "end": "\"",
+      "name": "string.quoted.double.rust",
+      "applyEndPatternLast": 1,
+      "contentName": "meta.embedded.block.sql",
+      "patterns": [
+        {
+          "match": "\\\\.",
+          "name": "constant.character.escape.rust"
+        },
+        {
+          "include": "source.sql"
+        }
+      ]
+    }
+  }
+}
