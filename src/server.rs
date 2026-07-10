@@ -5,19 +5,20 @@ use std::path::PathBuf;
 use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::{
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf, Registration,
-    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Url, WorkDoneProgressOptions,
+    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    MessageType, OneOf, Registration, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
+    WorkDoneProgressOptions,
 };
 use tower_lsp::{Client, LanguageServer, jsonrpc};
 
-use crate::analysis::{definition, hover, semantic_tokens};
+use crate::analysis::{completion, definition, hover, semantic_tokens};
 use crate::db::{DatabaseKind, Detection};
 use crate::document::Document;
 use crate::introspect::{self, SqliteDatabase};
@@ -234,6 +235,10 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_owned()]),
+                    ..CompletionOptions::default()
+                }),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -316,6 +321,27 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.remove(&params.text_document.uri);
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> jsonrpc::Result<Option<CompletionResponse>> {
+        let position_params = params.text_document_position;
+        let Some(document) = self.documents.get(&position_params.text_document.uri) else {
+            return Ok(None);
+        };
+        let workspace = self.workspace.read().await;
+        let items = completion::completions(
+            &document,
+            position_params.position,
+            &workspace.schema,
+            workspace.kind,
+        );
+        if items.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(CompletionResponse::Array(items)))
     }
 
     async fn goto_definition(
