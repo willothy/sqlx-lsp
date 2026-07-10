@@ -168,6 +168,17 @@ impl Schema {
         self.tables.insert(table.name.to_ascii_lowercase(), table);
     }
 
+    /// Adds introspected relations for anything not already defined by
+    /// migrations. Migration definitions win because they carry source
+    /// locations; the database fills in objects created outside them.
+    pub fn merge_database_tables(&mut self, tables: Vec<Table>) {
+        for table in tables {
+            if self.table(&table.name).is_none() {
+                self.insert_table(table);
+            }
+        }
+    }
+
     /// Builds a schema by replaying the `.sql` migrations under `dir` in
     /// version order. Reversible down-migrations (`*.down.sql`) are skipped.
     ///
@@ -681,6 +692,25 @@ mod tests {
             .clone();
         assert_eq!(id_location.range.start.line, 1);
         assert_eq!(id_location.range.start.character, 2);
+    }
+
+    #[test]
+    fn database_tables_fill_gaps_but_never_override_migrations() {
+        let mut schema = sqlite_schema("CREATE TABLE users (id INTEGER PRIMARY KEY);");
+        let database_table = |name: &str| Table {
+            name: name.to_owned(),
+            kind: TableKind::Table,
+            origin: TableOrigin::Database,
+            columns: Vec::new(),
+            location: None,
+        };
+        schema.merge_database_tables(vec![database_table("users"), database_table("sessions")]);
+
+        let users = schema.table("users").expect("exists");
+        assert_eq!(users.origin, TableOrigin::Migration);
+        assert!(users.column("id").is_some());
+        let sessions = schema.table("sessions").expect("merged in");
+        assert_eq!(sessions.origin, TableOrigin::Database);
     }
 
     #[test]
