@@ -21,8 +21,39 @@ use tower_lsp::{Client, LanguageServer, jsonrpc};
 use crate::analysis::{completion, definition, hover, semantic_tokens};
 use crate::db::{DatabaseKind, Detection};
 use crate::document::Document;
+use crate::embedded;
 use crate::introspect::{self, SqliteDatabase};
 use crate::schema::Schema;
+
+/// How an open document is served: as a SQL file, or as a Rust file whose
+/// sqlx query macros embed SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentLanguage {
+    Sql,
+    Rust,
+}
+
+impl DocumentLanguage {
+    /// Chooses by the client-reported language id, falling back to the file
+    /// extension when the id is unavailable (e.g. changes to unopened docs).
+    fn detect(language_id: Option<&str>, uri: &Url) -> DocumentLanguage {
+        let is_rust = match language_id {
+            Some(id) => id == "rust",
+            None => uri.path().ends_with(".rs"),
+        };
+        if is_rust {
+            DocumentLanguage::Rust
+        } else {
+            DocumentLanguage::Sql
+        }
+    }
+}
+
+/// An open editor document together with the language it is served as.
+struct OpenDocument {
+    document: Document,
+    language: DocumentLanguage,
+}
 
 /// Workspace-level state derived from configuration and schema sources on
 /// disk. Rebuilt whenever migrations, `Cargo.toml`, or `.env` change.
@@ -161,7 +192,7 @@ impl Workspace {
 /// The tower-lsp backend serving SQL language features.
 pub struct Backend {
     client: Client,
-    documents: DashMap<Url, Document>,
+    documents: DashMap<Url, OpenDocument>,
     workspace: RwLock<Workspace>,
 }
 
@@ -293,8 +324,14 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        self.documents
-            .insert(document.uri, Document::new(document.text, document.version));
+        let language = DocumentLanguage::detect(Some(&document.language_id), &document.uri);
+        self.documents.insert(
+            document.uri,
+            OpenDocument {
+                document: Document::new(document.text, document.version),
+                language,
+            },
+        );
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -305,10 +342,16 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
         match self.documents.get_mut(&uri) {
-            Some(mut document) => document.update(change.text, version),
+            Some(mut open) => open.document.update(change.text, version),
             None => {
-                self.documents
-                    .insert(uri, Document::new(change.text, version));
+                let language = DocumentLanguage::detect(None, &uri);
+                self.documents.insert(
+                    uri,
+                    OpenDocument {
+                        document: Document::new(change.text, version),
+                        language,
+                    },
+                );
             }
         }
     }
@@ -328,16 +371,24 @@ impl LanguageServer for Backend {
         params: CompletionParams,
     ) -> jsonrpc::Result<Option<CompletionResponse>> {
         let position_params = params.text_document_position;
-        let Some(document) = self.documents.get(&position_params.text_document.uri) else {
+        let Some(open) = self.documents.get(&position_params.text_document.uri) else {
             return Ok(None);
         };
         let workspace = self.workspace.read().await;
-        let items = completion::completions(
-            &document,
-            position_params.position,
-            &workspace.schema,
-            workspace.kind,
-        );
+        let items = match open.language {
+            DocumentLanguage::Sql => completion::completions(
+                &open.document,
+                position_params.position,
+                &workspace.schema,
+                workspace.kind,
+            ),
+            DocumentLanguage::Rust => embedded::completions(
+                &open.document,
+                position_params.position,
+                &workspace.schema,
+                workspace.kind,
+            ),
+        };
         if items.is_empty() {
             return Ok(None);
         }
@@ -349,42 +400,61 @@ impl LanguageServer for Backend {
         params: GotoDefinitionParams,
     ) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
         let position_params = params.text_document_position_params;
-        let Some(document) = self.documents.get(&position_params.text_document.uri) else {
+        let Some(open) = self.documents.get(&position_params.text_document.uri) else {
             return Ok(None);
         };
         let workspace = self.workspace.read().await;
-        Ok(definition::definition(
-            &document,
-            position_params.position,
-            &workspace.schema,
-            workspace.kind,
-        )
-        .map(GotoDefinitionResponse::Scalar))
+        let location = match open.language {
+            DocumentLanguage::Sql => definition::definition(
+                &open.document,
+                position_params.position,
+                &workspace.schema,
+                workspace.kind,
+            ),
+            DocumentLanguage::Rust => embedded::definition(
+                &open.document,
+                position_params.position,
+                &workspace.schema,
+                workspace.kind,
+            ),
+        };
+        Ok(location.map(GotoDefinitionResponse::Scalar))
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
         let position_params = params.text_document_position_params;
-        let Some(document) = self.documents.get(&position_params.text_document.uri) else {
+        let Some(open) = self.documents.get(&position_params.text_document.uri) else {
             return Ok(None);
         };
         let workspace = self.workspace.read().await;
-        Ok(hover::hover(
-            &document,
-            position_params.position,
-            &workspace.schema,
-            workspace.kind,
-        ))
+        Ok(match open.language {
+            DocumentLanguage::Sql => hover::hover(
+                &open.document,
+                position_params.position,
+                &workspace.schema,
+                workspace.kind,
+            ),
+            DocumentLanguage::Rust => embedded::hover(
+                &open.document,
+                position_params.position,
+                &workspace.schema,
+                workspace.kind,
+            ),
+        })
     }
 
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
     ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
-        let Some(document) = self.documents.get(&params.text_document.uri) else {
+        let Some(open) = self.documents.get(&params.text_document.uri) else {
             return Ok(None);
         };
         let kind = self.workspace.read().await.kind;
-        let data = semantic_tokens::semantic_tokens(&document, kind);
+        let data = match open.language {
+            DocumentLanguage::Sql => semantic_tokens::semantic_tokens(&open.document, kind),
+            DocumentLanguage::Rust => embedded::embedded_semantic_tokens(&open.document, kind),
+        };
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,
