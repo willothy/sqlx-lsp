@@ -87,12 +87,56 @@ pub struct Table {
     pub location: Option<SourceLocation>,
 }
 
+impl Column {
+    /// The column rendered as a SQL definition fragment,
+    /// e.g. `email TEXT NOT NULL DEFAULT 'x'`.
+    pub fn signature(&self) -> String {
+        let mut signature = self.name.clone();
+        if let Some(data_type) = &self.data_type {
+            signature.push(' ');
+            signature.push_str(data_type);
+        }
+        if self.primary_key {
+            signature.push_str(" PRIMARY KEY");
+        } else if self.not_null {
+            signature.push_str(" NOT NULL");
+        }
+        if let Some(default) = &self.default {
+            signature.push_str(" DEFAULT ");
+            signature.push_str(default);
+        }
+        signature
+    }
+}
+
 impl Table {
     /// Case-insensitive column lookup.
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns
             .iter()
             .find(|column| column.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The relation rendered as a `CREATE`-statement-shaped summary of what
+    /// the index knows about it.
+    pub fn ddl(&self) -> String {
+        let keyword = match self.kind {
+            TableKind::Table => "TABLE",
+            TableKind::View => "VIEW",
+        };
+        if self.columns.is_empty() {
+            return format!("CREATE {keyword} {}", self.name);
+        }
+        let columns: Vec<String> = self
+            .columns
+            .iter()
+            .map(|column| format!("  {}", column.signature()))
+            .collect();
+        format!(
+            "CREATE {keyword} {} (\n{}\n)",
+            self.name,
+            columns.join(",\n")
+        )
     }
 }
 
