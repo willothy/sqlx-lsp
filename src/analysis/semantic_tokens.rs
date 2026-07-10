@@ -307,9 +307,23 @@ fn base_class(token: &Token) -> Option<TokenClass> {
     }
 }
 
-/// Computes the full semantic token stream for `document`, delta-encoded as
-/// the LSP wire format requires.
-pub fn semantic_tokens(document: &Document, kind: DatabaseKind) -> Vec<SemanticToken> {
+/// One classified token at absolute document coordinates (UTF-16 units).
+/// Never spans more than one line.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenSegment {
+    /// 0-based line.
+    pub line: u32,
+    /// 0-based UTF-16 start character within the line.
+    pub start: u32,
+    /// Length in UTF-16 units.
+    pub length: u32,
+    class: TokenClass,
+}
+
+/// Computes classified token segments for `document` at absolute positions.
+/// Callers that embed SQL in a host document can shift the positions before
+/// [`encode`]-ing; plain SQL documents use [`semantic_tokens`] directly.
+pub fn segments(document: &Document, kind: DatabaseKind) -> Vec<TokenSegment> {
     let parsed = ParsedSql::parse(kind.dialect(), document.text());
 
     let mut overlay = Overlay::default();
@@ -317,10 +331,9 @@ pub fn semantic_tokens(document: &Document, kind: DatabaseKind) -> Vec<SemanticT
         let _ = statement.visit(&mut overlay);
     }
 
-    // (line, start character, length, class) in UTF-16 units, one entry per
-    // line: clients only accept single-line tokens without the multiline
-    // capability, so multi-line tokens (block comments) are split here.
-    let mut segments: Vec<(u32, u32, u32, TokenClass)> = Vec::new();
+    // One entry per line: clients only accept single-line tokens without the
+    // multiline capability, so multi-line tokens (block comments) are split.
+    let mut segments: Vec<TokenSegment> = Vec::new();
     for token in &parsed.tokens {
         let class = overlay
             .spans
@@ -346,33 +359,49 @@ pub fn semantic_tokens(document: &Document, kind: DatabaseKind) -> Vec<SemanticT
                 document.line_utf16_len(line)
             };
             if end > start {
-                segments.push((line, start, end - start, class));
+                segments.push(TokenSegment {
+                    line,
+                    start,
+                    length: end - start,
+                    class,
+                });
             }
         }
     }
-    segments.sort_by_key(|&(line, character, ..)| (line, character));
+    segments
+}
+
+/// Sorts `segments` and delta-encodes them as the LSP wire format requires.
+pub fn encode(mut segments: Vec<TokenSegment>) -> Vec<SemanticToken> {
+    segments.sort_by_key(|segment| (segment.line, segment.start));
 
     let mut data = Vec::with_capacity(segments.len());
     let mut previous_line = 0u32;
     let mut previous_start = 0u32;
-    for (line, start, length, class) in segments {
-        let delta_line = line - previous_line;
+    for segment in segments {
+        let delta_line = segment.line - previous_line;
         let delta_start = if delta_line == 0 {
-            start - previous_start
+            segment.start - previous_start
         } else {
-            start
+            segment.start
         };
         data.push(SemanticToken {
             delta_line,
             delta_start,
-            length,
-            token_type: class as u32,
+            length: segment.length,
+            token_type: segment.class as u32,
             token_modifiers_bitset: 0,
         });
-        previous_line = line;
-        previous_start = start;
+        previous_line = segment.line;
+        previous_start = segment.start;
     }
     data
+}
+
+/// Computes the full semantic token stream for `document`, delta-encoded as
+/// the LSP wire format requires.
+pub fn semantic_tokens(document: &Document, kind: DatabaseKind) -> Vec<SemanticToken> {
+    encode(segments(document, kind))
 }
 
 #[cfg(test)]
