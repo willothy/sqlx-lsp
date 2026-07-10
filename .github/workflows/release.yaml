@@ -1,0 +1,157 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds go through cargo-zigbuild so the glibc binaries
+          # stay compatible back to glibc 2.31 regardless of runner age.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            zigbuild: true
+            glibc: ".2.31"
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            zigbuild: true
+            glibc: ".2.31"
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zigbuild: true
+            glibc: ""
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zigbuild: true
+            glibc: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            zigbuild: false
+            glibc: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            zigbuild: false
+            glibc: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            zigbuild: false
+            glibc: ""
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            zigbuild: false
+            glibc: ""
+
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install zig
+        if: matrix.zigbuild
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          GLIBC: ${{ matrix.glibc }}
+          ZIGBUILD: ${{ matrix.zigbuild }}
+        run: |
+          if [[ "$ZIGBUILD" == "true" ]]; then
+            cargo zigbuild --release --locked --target "${TARGET}${GLIBC}"
+          else
+            cargo build --release --locked --target "$TARGET"
+          fi
+
+      - name: Stage binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          ext=""
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+          mkdir dist
+          cp "target/${TARGET}/release/sqlx-lsp${ext}" "dist/sqlx-lsp-${TARGET}${ext}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlx-lsp-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd binaries
+          sha256sum -- * > SHA256SUMS
+
+      - name: Determine release kind
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            {
+              echo "kind=release"
+              echo "tag=${GITHUB_REF_NAME}"
+              echo "name=${GITHUB_REF_NAME}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "kind=nightly"
+              echo "tag=nightly"
+              echo "name=nightly"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # Keep the rolling nightly tag pointing at the commit that was built,
+      # so the nightly release always matches its sources.
+      - name: Move nightly tag
+        if: steps.meta.outputs.kind == 'nightly'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly
+          git push origin nightly --force
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          prerelease: ${{ steps.meta.outputs.kind == 'nightly' }}
+          generate_release_notes: ${{ steps.meta.outputs.kind == 'release' }}
+          body: ${{ steps.meta.outputs.kind == 'nightly' && format('Nightly build of {0}.', github.sha) || '' }}
+          files: binaries/*
