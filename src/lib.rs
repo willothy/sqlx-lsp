@@ -11,3 +11,4 @@ pub mod document;
 pub mod introspect;
 pub mod parse;
 pub mod schema;
+pub mod server;

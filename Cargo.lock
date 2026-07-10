@@ -1119,6 +1119,7 @@ version = "0.1.0"
 dependencies = [
  "cargo_metadata",
  "dashmap 6.2.1",
+ "serde_json",
  "sqlparser",
  "sqlx",
  "tempfile",
