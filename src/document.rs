@@ -129,6 +129,28 @@ impl Document {
         Some(Range { start, end })
     }
 
+    /// Converts a byte offset to an LSP position.
+    ///
+    /// Offsets past the end of the text clamp to the end; an offset inside a
+    /// multi-byte character maps to the position of that character.
+    pub fn position_at(&self, offset: usize) -> Position {
+        let offset = offset.min(self.text.len());
+        // `line_starts[0]` is 0, so the partition point is at least 1.
+        let line = self.line_starts.partition_point(|&start| start <= offset) - 1;
+        let line_start = self.line_starts[line];
+        let mut character = 0u32;
+        for (byte, ch) in self.text[line_start..].char_indices() {
+            if line_start + byte >= offset {
+                break;
+            }
+            character += ch.len_utf16() as u32;
+        }
+        Position {
+            line: line as u32,
+            character,
+        }
+    }
+
     /// The UTF-16 length of a 0-based line, excluding its trailing newline.
     /// Returns 0 for lines past the end of the document.
     pub fn line_utf16_len(&self, line: u32) -> u32 {

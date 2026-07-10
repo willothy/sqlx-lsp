@@ -9,6 +9,7 @@
 pub mod analysis;
 pub mod db;
 pub mod document;
+pub mod embedded;
 pub mod introspect;
 pub mod parse;
 pub mod schema;
