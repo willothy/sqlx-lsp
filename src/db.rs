@@ -183,10 +183,14 @@ mod tests {
     }
 
     #[test]
-    fn detects_sqlite_for_this_workspace() {
-        // This crate itself depends on sqlx with the `sqlite` feature, which
-        // makes it a real end-to-end fixture for resolved-feature detection.
+    fn detects_drivers_for_this_workspace() {
+        // This crate itself depends on sqlx with the `sqlite` and `postgres`
+        // features, which makes it a real end-to-end fixture for
+        // resolved-feature detection: both drivers are found and the
+        // priority order selects PostgreSQL.
         let detection = Detection::detect(Path::new(env!("CARGO_MANIFEST_DIR"))).expect("detects");
-        assert_eq!(detection.kind, DatabaseKind::Sqlite);
+        assert!(detection.enabled.contains(&DatabaseKind::Sqlite));
+        assert!(detection.enabled.contains(&DatabaseKind::Postgres));
+        assert_eq!(detection.kind, DatabaseKind::Postgres);
     }
 }

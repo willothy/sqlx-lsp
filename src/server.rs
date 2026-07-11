@@ -22,7 +22,7 @@ use crate::analysis::{completion, definition, hover, semantic_tokens};
 use crate::db::{DatabaseKind, Detection};
 use crate::document::Document;
 use crate::embedded;
-use crate::introspect::{self, SqliteDatabase};
+use crate::introspect::{self, LiveDatabase};
 use crate::schema::Schema;
 
 /// How an open document is served: as a SQL file, or as a Rust file whose
@@ -151,10 +151,8 @@ impl Workspace {
             }
         };
 
-        if kind == DatabaseKind::Sqlite
-            && let Some(url) = introspect::discover_database_url(&root)
-        {
-            match SqliteDatabase::from_url(&url, &root) {
+        if let Some(url) = introspect::discover_database_url(&root) {
+            match LiveDatabase::from_url(&url, kind, &root) {
                 Ok(database) => match database.introspect().await {
                     Ok(tables) => {
                         log.push((
@@ -162,7 +160,7 @@ impl Workspace {
                             format!(
                                 "introspected {} relation(s) from {}",
                                 tables.len(),
-                                database.path().display()
+                                database.describe()
                             ),
                         ));
                         schema.merge_database_tables(tables);
