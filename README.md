@@ -19,11 +19,12 @@ index from your migrations, and serves editor features against that schema.
   `CREATE VIEW`, `ALTER TABLE`, and `DROP` statements. Definitions keep their
   source locations. If `DATABASE_URL` (from the environment or `.env`) points
   at a reachable database, the server also introspects it and fills in any
-  relations the migrations don't cover: SQLite files are opened read-only,
-  and PostgreSQL is queried through its system catalogs on a session forced
-  to `default_transaction_read_only`, covering every table, view, and
-  materialized view visible on the search path. Passwords never appear in
-  logs or error messages.
+  relations the migrations don't cover. SQLite files are opened read-only;
+  PostgreSQL is queried through its system catalogs on a session forced to
+  `default_transaction_read_only`, covering every table, view, and
+  materialized view visible on the search path; MySQL is queried through
+  `information_schema` on a `READ ONLY` session, covering the URL's
+  database. Passwords never appear in logs or error messages.
 - **Completion** — context-aware: tables after `FROM`/`JOIN`/`INTO`/`UPDATE`,
   columns of the qualified relation after `alias.` or `table.`, and in-scope
   columns plus tables, keywords, and common functions elsewhere. Works on
@@ -50,9 +51,8 @@ index from your migrations, and serves editor features against that schema.
 The schema index reloads automatically when migrations, `Cargo.toml`, or
 `.env` change (via client file watching, with a save-based fallback).
 
-SQLite and PostgreSQL are fully supported, including live introspection.
-MySQL projects get dialect-correct parsing and migration-based schema
-features; live introspection for MySQL is not implemented yet.
+All three backends — SQLite, PostgreSQL, and MySQL — are fully supported,
+including live introspection.
 
 ## Installation
 
