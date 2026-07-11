@@ -14,10 +14,12 @@ index from your migrations, and serves editor features against that schema.
   via `cargo metadata`. `sqlite`, `postgres`, and `mysql` select the matching
   SQL dialect for parsing; when several are enabled the server prefers
   `postgres` > `mysql` > `sqlite` and logs the ambiguity.
-- **Schema index** — replays the `.sql` migrations under `migrations/` in
-  sqlx version order (skipping `*.down.sql`), applying `CREATE TABLE`,
-  `CREATE VIEW`, `ALTER TABLE`, and `DROP` statements. Definitions keep their
-  source locations. If `DATABASE_URL` (from the environment or `.env`) points
+- **Schema index** — replays the `.sql` migrations under each crate's
+  `migrations/` directory in sqlx version order (skipping `*.down.sql`),
+  applying `CREATE TABLE`, `CREATE VIEW`, `ALTER TABLE`, and `DROP`
+  statements. Definitions keep their source locations. Monorepos work: the
+  server resolves the cargo workspace members below the editor's root and
+  searches every member crate for migrations and `.env`. If `DATABASE_URL` (from the environment or `.env`) points
   at a reachable database, the server also introspects it and fills in any
   relations the migrations don't cover. SQLite files are opened read-only;
   PostgreSQL is queried through its system catalogs on a session forced to
