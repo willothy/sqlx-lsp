@@ -45,15 +45,22 @@ fn redact_url(url: &str) -> String {
 }
 
 /// Reads `DATABASE_URL` the way sqlx does: from the process environment
-/// first, then from a `.env` file at the workspace root.
-pub fn discover_database_url(root: &Path) -> Option<String> {
+/// first, then from the first `.env` file found in `roots` (the workspace
+/// root followed by its member crate directories).
+pub fn discover_database_url<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Option<String> {
     if let Ok(url) = std::env::var("DATABASE_URL")
         && !url.is_empty()
     {
         return Some(url);
     }
-    let env_file = std::fs::read_to_string(root.join(".env")).ok()?;
-    EnvFile::new(&env_file).value_of("DATABASE_URL")
+    for root in roots {
+        if let Ok(env_file) = std::fs::read_to_string(root.join(".env"))
+            && let Some(url) = EnvFile::new(&env_file).value_of("DATABASE_URL")
+        {
+            return Some(url);
+        }
+    }
+    None
 }
 
 /// A parsed view over dotenv-style `KEY=VALUE` file contents.
@@ -590,6 +597,26 @@ mod tests {
         );
         assert_eq!(env.value_of("OTHER").as_deref(), Some("x=y"));
         assert_eq!(env.value_of("MISSING"), None);
+    }
+
+    #[test]
+    fn database_url_is_discovered_across_search_roots() {
+        // The ambient environment shadows .env files by design; the .env
+        // path can only be asserted when the variable is unset.
+        if std::env::var("DATABASE_URL").is_ok() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path().join("repo");
+        let crate_root = repo_root.join("backend");
+        std::fs::create_dir_all(&crate_root).expect("mkdir");
+        std::fs::write(crate_root.join(".env"), "DATABASE_URL=sqlite://app.db\n")
+            .expect("write .env");
+
+        // Not at the first root, found at the member crate root.
+        let url = discover_database_url([repo_root.as_path(), crate_root.as_path()]);
+        assert_eq!(url.as_deref(), Some("sqlite://app.db"));
+        assert_eq!(discover_database_url([repo_root.as_path()]), None);
     }
 
     #[test]

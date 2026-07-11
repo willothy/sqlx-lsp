@@ -224,14 +224,23 @@ impl Schema {
     }
 
     /// Builds a schema by replaying the `.sql` migrations under `dir` in
-    /// version order. Reversible down-migrations (`*.down.sql`) are skipped.
-    ///
-    /// A missing directory yields an empty schema; a workspace without
-    /// migrations is not an error.
+    /// version order.
     pub fn load_migrations(dir: &Path, kind: DatabaseKind) -> Result<Schema, SchemaError> {
         let mut schema = Schema::default();
+        schema.apply_migrations(dir, kind)?;
+        Ok(schema)
+    }
+
+    /// Replays the `.sql` migrations under `dir` in version order into this
+    /// schema. Reversible down-migrations (`*.down.sql`) are skipped.
+    /// Workspaces can hold several migration directories (one per member
+    /// crate); applying each into one schema indexes them all.
+    ///
+    /// A missing directory applies nothing; a crate without migrations is
+    /// not an error.
+    pub fn apply_migrations(&mut self, dir: &Path, kind: DatabaseKind) -> Result<(), SchemaError> {
         if !dir.is_dir() {
-            return Ok(schema);
+            return Ok(());
         }
 
         let entries = std::fs::read_dir(dir).map_err(|source| SchemaError::ReadDir {
@@ -269,9 +278,9 @@ impl Schema {
             let uri = Url::from_file_path(&absolute).map_err(|()| SchemaError::InvalidPath {
                 path: file.path.clone(),
             })?;
-            schema.apply_sql(&text, kind, Some(&uri));
+            self.apply_sql(&text, kind, Some(&uri));
         }
-        Ok(schema)
+        Ok(())
     }
 
     /// Applies every DDL statement in `sql` to the index. Statements that
@@ -755,6 +764,35 @@ mod tests {
         assert!(users.column("id").is_some());
         let sessions = schema.table("sessions").expect("merged in");
         assert_eq!(sessions.origin, TableOrigin::Database);
+    }
+
+    #[test]
+    fn migrations_from_several_directories_share_one_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let users_dir = dir.path().join("users-svc");
+        let posts_dir = dir.path().join("posts-svc");
+        std::fs::create_dir_all(&users_dir).expect("mkdir");
+        std::fs::create_dir_all(&posts_dir).expect("mkdir");
+        std::fs::write(
+            users_dir.join("1_init.sql"),
+            "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+        )
+        .expect("write migration");
+        std::fs::write(
+            posts_dir.join("1_init.sql"),
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY);",
+        )
+        .expect("write migration");
+
+        let mut schema = Schema::default();
+        schema
+            .apply_migrations(&users_dir, DatabaseKind::Sqlite)
+            .expect("applies");
+        schema
+            .apply_migrations(&posts_dir, DatabaseKind::Sqlite)
+            .expect("applies");
+        assert!(schema.table("users").is_some());
+        assert!(schema.table("posts").is_some());
     }
 
     #[test]

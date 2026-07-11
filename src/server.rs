@@ -90,8 +90,10 @@ impl Workspace {
         let detection_root = root.clone();
         let detection =
             tokio::task::spawn_blocking(move || Detection::detect(&detection_root)).await;
+        let mut member_roots = Vec::new();
         let kind = match detection {
             Ok(Ok(detection)) => {
+                member_roots = detection.member_roots.clone();
                 if detection.enabled.len() > 1 {
                     log.push((
                         MessageType::WARNING,
@@ -129,18 +131,52 @@ impl Workspace {
             }
         };
 
-        let migrations_dir = root.join("migrations");
-        let schema_result =
-            tokio::task::spawn_blocking(move || Schema::load_migrations(&migrations_dir, kind))
-                .await;
+        // Editors often use the repository root as the LSP workspace root
+        // while migrations and `.env` files live next to the crate manifests
+        // below it, so every member crate directory is a search root too.
+        let mut search_roots = vec![root.clone()];
+        for member in member_roots {
+            if !search_roots.contains(&member) {
+                search_roots.push(member);
+            }
+        }
+
+        let load_roots = search_roots.clone();
+        let schema_result = tokio::task::spawn_blocking(move || {
+            let mut schema = Schema::default();
+            let mut loaded = Vec::new();
+            let mut failed = Vec::new();
+            for dir in load_roots {
+                let migrations = dir.join("migrations");
+                if !migrations.is_dir() {
+                    continue;
+                }
+                match schema.apply_migrations(&migrations, kind) {
+                    Ok(()) => loaded.push(migrations),
+                    Err(error) => failed.push((migrations, error)),
+                }
+            }
+            (schema, loaded, failed)
+        })
+        .await;
         let mut schema = match schema_result {
-            Ok(Ok(schema)) => schema,
-            Ok(Err(error)) => {
-                log.push((
-                    MessageType::WARNING,
-                    format!("failed to load migrations: {error}"),
-                ));
-                Schema::default()
+            Ok((schema, loaded, failed)) => {
+                for migrations in loaded {
+                    log.push((
+                        MessageType::INFO,
+                        format!("replayed migrations from {}", migrations.display()),
+                    ));
+                }
+                for (migrations, error) in failed {
+                    log.push((
+                        MessageType::WARNING,
+                        format!(
+                            "failed to load migrations from {}: {error}",
+                            migrations.display()
+                        ),
+                    ));
+                }
+                schema
             }
             Err(join_error) => {
                 log.push((
@@ -151,7 +187,9 @@ impl Workspace {
             }
         };
 
-        if let Some(url) = introspect::discover_database_url(&root) {
+        if let Some(url) =
+            introspect::discover_database_url(search_roots.iter().map(PathBuf::as_path))
+        {
             match LiveDatabase::from_url(&url, kind, &root) {
                 Ok(database) => match database.introspect().await {
                     Ok(tables) => {

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cargo_metadata::MetadataCommand;
 use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
@@ -95,14 +95,35 @@ pub struct Detection {
     /// element when the workspace enables several drivers; [`Detection::kind`]
     /// is then the highest-priority member.
     pub enabled: BTreeSet<DatabaseKind>,
+    /// Directories of the cargo workspace's member crates, sorted and
+    /// deduplicated. Editors often use a repository root as the LSP
+    /// workspace root; migrations and `.env` files live next to crate
+    /// manifests, so these are the places to look for them.
+    pub member_roots: Vec<PathBuf>,
 }
 
 impl Detection {
-    /// Detects the backend for the workspace containing `manifest_dir` by
+    /// Detects the backend for the workspace containing (or below) `root` by
     /// resolving the dependency graph and inspecting the features enabled on
     /// the `sqlx` package.
-    pub fn detect(manifest_dir: &Path) -> Result<Detection, DetectError> {
-        let metadata = MetadataCommand::new().current_dir(manifest_dir).exec()?;
+    pub fn detect(root: &Path) -> Result<Detection, DetectError> {
+        let manifest_dir = Self::find_manifest_dir(root);
+        let metadata = MetadataCommand::new().current_dir(&manifest_dir).exec()?;
+
+        let mut member_roots: Vec<PathBuf> = metadata
+            .workspace_members
+            .iter()
+            .filter_map(|member| {
+                metadata
+                    .packages
+                    .iter()
+                    .find(|package| &package.id == member)
+            })
+            .filter_map(|package| package.manifest_path.parent())
+            .map(|dir| dir.as_std_path().to_owned())
+            .collect();
+        member_roots.sort();
+        member_roots.dedup();
 
         let sqlx_ids: BTreeSet<_> = metadata
             .packages
@@ -129,7 +150,52 @@ impl Detection {
                     .map(|feature| -> &str { feature.as_ref() })
             });
 
-        Detection::from_features(feature_names)
+        let mut detection = Detection::from_features(feature_names)?;
+        detection.member_roots = member_roots;
+        Ok(detection)
+    }
+
+    /// The directory whose manifest anchors `cargo metadata`: `root` itself
+    /// when it contains a `Cargo.toml`, otherwise the first crate found by a
+    /// shallow breadth-first scan. Editors frequently hand us a repository
+    /// root that only *contains* the Rust workspace (monorepos), and cargo
+    /// only searches upward on its own.
+    fn find_manifest_dir(root: &Path) -> PathBuf {
+        if root.join("Cargo.toml").is_file() {
+            return root.to_owned();
+        }
+
+        let mut current_level = vec![root.to_owned()];
+        for _depth in 0..3 {
+            let mut next_level = Vec::new();
+            for dir in current_level {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                let mut subdirs: Vec<PathBuf> = entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir())
+                    .filter(|path| {
+                        !path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with('.') || name == "target" || name == "node_modules"
+                            })
+                    })
+                    .collect();
+                subdirs.sort();
+                for subdir in subdirs {
+                    if subdir.join("Cargo.toml").is_file() {
+                        return subdir;
+                    }
+                    next_level.push(subdir);
+                }
+            }
+            current_level = next_level;
+        }
+        root.to_owned()
     }
 
     /// Builds a detection from the set of feature names enabled on the `sqlx`
@@ -149,7 +215,11 @@ impl Detection {
             .find(|kind| enabled.contains(kind))
             .ok_or(DetectError::NoDriverFeature)?;
 
-        Ok(Detection { kind, enabled })
+        Ok(Detection {
+            kind,
+            enabled,
+            member_roots: Vec::new(),
+        })
     }
 }
 
@@ -193,5 +263,31 @@ mod tests {
         assert!(detection.enabled.contains(&DatabaseKind::Postgres));
         assert!(detection.enabled.contains(&DatabaseKind::MySql));
         assert_eq!(detection.kind, DatabaseKind::Postgres);
+        assert!(
+            detection
+                .member_roots
+                .contains(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+        );
+    }
+
+    #[test]
+    fn finds_manifests_below_a_non_cargo_root() {
+        // A repository root that merely contains the crate (a monorepo):
+        // detection must scan downward to find the manifest. The fixture
+        // crate has no sqlx dependency, so reaching `SqlxNotFound` (instead
+        // of a metadata failure) proves the nested manifest was found and
+        // resolved.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crate_dir = dir.path().join("services").join("backend");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("mkdir");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(crate_dir.join("src").join("lib.rs"), "").expect("write lib");
+
+        let error = Detection::detect(dir.path()).unwrap_err();
+        assert!(matches!(error, DetectError::SqlxNotFound), "{error}");
     }
 }
