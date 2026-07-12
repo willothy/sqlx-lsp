@@ -99,20 +99,36 @@ pub enum DetectError {
     NoDriverFeature,
 }
 
+/// A workspace member crate that declares a direct dependency on sqlx.
+/// Each one anchors a database context: its own configuration, migrations,
+/// and connection URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlxMember {
+    /// The member crate's directory (where its `Cargo.toml` lives).
+    pub root: PathBuf,
+    /// Driver features the member's declared sqlx dependency enables.
+    /// Empty when the member enables no driver itself (e.g. it relies on
+    /// another crate enabling one); the workspace-unified set then applies.
+    pub drivers: BTreeSet<DatabaseKind>,
+}
+
 /// The outcome of backend detection for a workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
-    /// The backend the server operates against.
+    /// The backend the server operates against when nothing more specific
+    /// (a member's declared drivers or a URL scheme) decides.
     pub kind: DatabaseKind,
-    /// Every backend whose driver feature is enabled. Contains more than one
-    /// element when the workspace enables several drivers; [`Detection::kind`]
-    /// is then the highest-priority member.
+    /// Every backend whose driver feature is enabled anywhere in the
+    /// workspace (Cargo's unified feature set on the sqlx package).
     pub enabled: BTreeSet<DatabaseKind>,
     /// Directories of the cargo workspace's member crates, sorted and
     /// deduplicated. Editors often use a repository root as the LSP
     /// workspace root; migrations and `.env` files live next to crate
     /// manifests, so these are the places to look for them.
     pub member_roots: Vec<PathBuf>,
+    /// The member crates that depend on sqlx directly, in `member_roots`
+    /// order.
+    pub sqlx_members: Vec<SqlxMember>,
 }
 
 impl Detection {
@@ -123,7 +139,7 @@ impl Detection {
         let manifest_dir = Self::find_manifest_dir(root);
         let metadata = MetadataCommand::new().current_dir(&manifest_dir).exec()?;
 
-        let mut member_roots: Vec<PathBuf> = metadata
+        let member_packages: Vec<_> = metadata
             .workspace_members
             .iter()
             .filter_map(|member| {
@@ -132,11 +148,38 @@ impl Detection {
                     .iter()
                     .find(|package| &package.id == member)
             })
+            .collect();
+
+        let mut member_roots: Vec<PathBuf> = member_packages
+            .iter()
             .filter_map(|package| package.manifest_path.parent())
             .map(|dir| dir.as_std_path().to_owned())
             .collect();
         member_roots.sort();
         member_roots.dedup();
+
+        let mut sqlx_members: Vec<SqlxMember> = member_packages
+            .iter()
+            .filter_map(|package| {
+                let root = package.manifest_path.parent()?.as_std_path().to_owned();
+                let sqlx_dep = package
+                    .dependencies
+                    .iter()
+                    .find(|dependency| dependency.name == "sqlx")?;
+                let drivers = DatabaseKind::ALL
+                    .into_iter()
+                    .filter(|kind| {
+                        sqlx_dep
+                            .features
+                            .iter()
+                            .any(|feature| feature.as_str() == kind.feature_name())
+                    })
+                    .collect();
+                Some(SqlxMember { root, drivers })
+            })
+            .collect();
+        sqlx_members.sort_by(|a, b| a.root.cmp(&b.root));
+        sqlx_members.dedup();
 
         let sqlx_ids: BTreeSet<_> = metadata
             .packages
@@ -165,6 +208,7 @@ impl Detection {
 
         let mut detection = Detection::from_features(feature_names)?;
         detection.member_roots = member_roots;
+        detection.sqlx_members = sqlx_members;
         Ok(detection)
     }
 
@@ -232,6 +276,7 @@ impl Detection {
             kind,
             enabled,
             member_roots: Vec::new(),
+            sqlx_members: Vec::new(),
         })
     }
 }

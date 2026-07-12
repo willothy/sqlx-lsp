@@ -1,0 +1,692 @@
+//! Per-crate database contexts.
+//!
+//! sqlx's compile-time machinery is anchored at the invoking crate: its
+//! `sqlx.toml`, its environment (URL variable and ancestor `.env` files),
+//! and its migrations all resolve relative to `CARGO_MANIFEST_DIR`. The
+//! workspace therefore holds one database context per sqlx-dependent member
+//! crate, and every document is served by the context of the crate that
+//! contains it. Documents outside any such crate fall back to a
+//! workspace-wide context whose schema merges every context, so shared SQL
+//! still resolves.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use tower_lsp::lsp_types::{MessageType, Url};
+
+use crate::config::SqlxConfig;
+use crate::db::{DatabaseKind, Detection, SqlxMember};
+use crate::embedded::{self, MigrateSource};
+use crate::introspect::{self, LiveDatabase};
+use crate::schema::Schema;
+
+/// Log lines produced while loading, forwarded to the LSP client.
+pub type LoadLog = Vec<(MessageType, String)>;
+
+/// The database context one crate's SQL is served against.
+#[derive(Debug)]
+pub struct DbContext {
+    /// The crate directory this context belongs to (the workspace root for
+    /// the fallback context).
+    pub root: PathBuf,
+    /// The backend the crate's queries target.
+    pub kind: DatabaseKind,
+    /// The schema index built from the crate's migrations and, when
+    /// reachable, its live database.
+    pub schema: Schema,
+}
+
+/// Workspace-level state derived from configuration and schema sources on
+/// disk. Rebuilt whenever migrations, manifests, `sqlx.toml`, or `.env`
+/// change.
+#[derive(Debug)]
+pub struct Workspace {
+    /// The workspace root, when the client provided one.
+    pub root: Option<PathBuf>,
+    /// One context per sqlx-dependent member crate.
+    pub contexts: Vec<DbContext>,
+    /// Serves documents that belong to no context crate. Its schema merges
+    /// every context (later crates win name collisions), so shared SQL
+    /// outside any crate still resolves.
+    pub fallback: DbContext,
+    /// Every migrations directory the schema indexes were built from, for
+    /// save-triggered reloads.
+    pub migration_dirs: Vec<PathBuf>,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Workspace {
+            root: None,
+            contexts: Vec::new(),
+            fallback: DbContext {
+                root: PathBuf::new(),
+                // SQL parsing needs *a* dialect even before (or without)
+                // successful detection; SQLite is the most permissive of the
+                // supported set.
+                kind: DatabaseKind::Sqlite,
+                schema: Schema::default(),
+            },
+            migration_dirs: Vec::new(),
+        }
+    }
+}
+
+impl Workspace {
+    /// The context serving `uri`: the deepest context crate containing the
+    /// file, or the fallback.
+    pub fn context_for(&self, uri: &Url) -> &DbContext {
+        let Ok(path) = uri.to_file_path() else {
+            return &self.fallback;
+        };
+        // Context roots come from `cargo metadata` canonicalized; editor
+        // URIs may spell the same file through symlinks (`/var` vs
+        // `/private/var` on macOS).
+        let path = normalize(path);
+        self.contexts
+            .iter()
+            .filter(|context| path.starts_with(&context.root))
+            .max_by_key(|context| context.root.components().count())
+            .unwrap_or(&self.fallback)
+    }
+
+    /// Rebuilds the workspace state for `root`: re-detects the sqlx member
+    /// crates and builds a database context for each. Failures degrade per
+    /// component and are reported in the returned log lines.
+    pub async fn load(root: PathBuf) -> (Workspace, LoadLog) {
+        let mut log = Vec::new();
+
+        let detection_root = root.clone();
+        let detection =
+            tokio::task::spawn_blocking(move || Detection::detect(&detection_root)).await;
+        let (global_kind, enabled, sqlx_members) = match detection {
+            Ok(Ok(detection)) => {
+                log.push((
+                    MessageType::INFO,
+                    format!(
+                        "workspace default backend: {} ({} sqlx crate(s))",
+                        detection.kind,
+                        detection.sqlx_members.len()
+                    ),
+                ));
+                (detection.kind, detection.enabled, detection.sqlx_members)
+            }
+            Ok(Err(error)) => {
+                log.push((
+                    MessageType::WARNING,
+                    format!("database detection failed ({error}); defaulting to SQLite"),
+                ));
+                (DatabaseKind::Sqlite, BTreeSet::new(), Vec::new())
+            }
+            Err(join_error) => {
+                log.push((
+                    MessageType::ERROR,
+                    format!("database detection task failed: {join_error}"),
+                ));
+                (DatabaseKind::Sqlite, BTreeSet::new(), Vec::new())
+            }
+        };
+
+        let mut contexts = Vec::new();
+        let mut migration_dirs = Vec::new();
+        for member in sqlx_members {
+            let (context, dirs) =
+                DbContext::load(member, global_kind, enabled.clone(), &mut log).await;
+            migration_dirs.extend(dirs);
+            contexts.push(context);
+        }
+
+        // The fallback context: root-level configuration and environment,
+        // with every member context's schema merged in.
+        let fallback_root = root.clone();
+        let fallback_enabled = enabled.clone();
+        let fallback = tokio::task::spawn_blocking(move || {
+            let mut notes = LoadLog::new();
+            let config = SqlxConfig::load(&fallback_root).unwrap_or_else(|error| {
+                notes.push((MessageType::WARNING, error.to_string()));
+                SqlxConfig::default()
+            });
+            let env = introspect::discover_macro_env(&fallback_root, config.database_url_var());
+            let kind = resolve_kind(
+                env.database_url.as_deref(),
+                &BTreeSet::new(),
+                global_kind,
+                &fallback_enabled,
+                &mut notes,
+            );
+            let mut schema = Schema::default();
+            let migrations = config.migrations_dir(&fallback_root);
+            let mut dir = None;
+            if migrations.is_dir()
+                && let Err(error) = schema.apply_migrations(&migrations, kind)
+            {
+                notes.push((
+                    MessageType::WARNING,
+                    format!(
+                        "failed to load migrations from {}: {error}",
+                        migrations.display()
+                    ),
+                ));
+            } else if migrations.is_dir() {
+                dir = Some(migrations);
+            }
+            (env, kind, schema, dir, notes)
+        })
+        .await;
+
+        let (fallback_env, fallback_kind, mut fallback_schema, fallback_dir, notes) = match fallback
+        {
+            Ok(parts) => parts,
+            Err(join_error) => {
+                log.push((
+                    MessageType::ERROR,
+                    format!("workspace loading task failed: {join_error}"),
+                ));
+                (
+                    introspect::MacroEnv::default(),
+                    global_kind,
+                    Schema::default(),
+                    None,
+                    LoadLog::new(),
+                )
+            }
+        };
+        log.extend(notes);
+        if let Some(dir) = fallback_dir
+            && !migration_dirs.contains(&dir)
+        {
+            migration_dirs.push(dir);
+        }
+
+        // Only introspect at the workspace level when no member context
+        // exists (a plain directory of SQL, or detection failed); contexts
+        // otherwise carry their own introspected schemas into the merge.
+        if contexts.is_empty()
+            && !fallback_env.offline
+            && let Some(url) = &fallback_env.database_url
+        {
+            introspect_into(&mut fallback_schema, url, fallback_kind, &root, &mut log).await;
+        }
+
+        for context in &contexts {
+            for table in context.schema.tables() {
+                fallback_schema.insert_table(table.clone());
+            }
+        }
+
+        log.push((
+            MessageType::INFO,
+            format!(
+                "{} context(s); workspace-wide index holds {} relation(s)",
+                contexts.len(),
+                fallback_schema.tables().count()
+            ),
+        ));
+
+        (
+            Workspace {
+                root: Some(root.clone()),
+                contexts,
+                fallback: DbContext {
+                    root,
+                    kind: fallback_kind,
+                    schema: fallback_schema,
+                },
+                migration_dirs,
+            },
+            log,
+        )
+    }
+}
+
+impl DbContext {
+    /// Builds the context for one sqlx-dependent member crate: reads its
+    /// `sqlx.toml` and environment, resolves the backend, replays the
+    /// migrations it consumes, and introspects its live database when
+    /// reachable. Returns the context and the migration directories it
+    /// loaded.
+    async fn load(
+        member: SqlxMember,
+        global_kind: DatabaseKind,
+        enabled: BTreeSet<DatabaseKind>,
+        log: &mut LoadLog,
+    ) -> (DbContext, Vec<PathBuf>) {
+        let root = member.root.clone();
+
+        let blocking_root = root.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let mut notes = LoadLog::new();
+            let config = SqlxConfig::load(&blocking_root).unwrap_or_else(|error| {
+                notes.push((MessageType::WARNING, error.to_string()));
+                SqlxConfig::default()
+            });
+            let env = introspect::discover_macro_env(&blocking_root, config.database_url_var());
+            let kind = resolve_kind(
+                env.database_url.as_deref(),
+                &member.drivers,
+                global_kind,
+                &enabled,
+                &mut notes,
+            );
+
+            let mut schema = Schema::default();
+            let mut applied = Vec::new();
+            for dir in migration_dirs_for(&blocking_root, &config, &mut notes) {
+                if !dir.is_dir() {
+                    continue;
+                }
+                match schema.apply_migrations(&dir, kind) {
+                    Ok(()) => applied.push(dir),
+                    Err(error) => notes.push((
+                        MessageType::WARNING,
+                        format!("failed to load migrations from {}: {error}", dir.display()),
+                    )),
+                }
+            }
+            (env, kind, schema, applied, notes)
+        })
+        .await;
+
+        let (env, kind, mut schema, applied, notes) = match loaded {
+            Ok(parts) => parts,
+            Err(join_error) => {
+                log.push((
+                    MessageType::ERROR,
+                    format!("context loading task failed: {join_error}"),
+                ));
+                (
+                    introspect::MacroEnv::default(),
+                    global_kind,
+                    Schema::default(),
+                    Vec::new(),
+                    LoadLog::new(),
+                )
+            }
+        };
+        log.extend(notes);
+
+        if env.offline {
+            log.push((
+                MessageType::INFO,
+                format!(
+                    "SQLX_OFFLINE is set for {}; skipping live introspection",
+                    root.display()
+                ),
+            ));
+        } else if let Some(url) = &env.database_url {
+            introspect_into(&mut schema, url, kind, &root, log).await;
+        }
+
+        log.push((
+            MessageType::INFO,
+            format!(
+                "context {}: {kind}, {} relation(s)",
+                root.display(),
+                schema.tables().count()
+            ),
+        ));
+
+        (DbContext { root, kind, schema }, applied)
+    }
+}
+
+/// Introspects the database at `url` and merges the result into `schema`,
+/// logging the outcome. Failures are informational: an unreachable database
+/// only means the live layer is missing.
+async fn introspect_into(
+    schema: &mut Schema,
+    url: &str,
+    kind: DatabaseKind,
+    root: &Path,
+    log: &mut LoadLog,
+) {
+    match LiveDatabase::from_url(url, kind, root) {
+        Ok(database) => match database.introspect().await {
+            Ok(tables) => {
+                log.push((
+                    MessageType::INFO,
+                    format!(
+                        "introspected {} relation(s) from {}",
+                        tables.len(),
+                        database.describe()
+                    ),
+                ));
+                schema.merge_database_tables(tables);
+            }
+            Err(error) => log.push((MessageType::INFO, error.to_string())),
+        },
+        Err(error) => log.push((MessageType::INFO, error.to_string())),
+    }
+}
+
+/// Chooses a context's backend the way the sqlx macros select a driver: the
+/// URL scheme decides, gated on that driver being available (the member's
+/// declared drivers when it declares any, the workspace-unified feature set
+/// otherwise). Without a URL, the highest-priority declared driver wins,
+/// then the workspace default.
+fn resolve_kind(
+    url: Option<&str>,
+    declared: &BTreeSet<DatabaseKind>,
+    global_kind: DatabaseKind,
+    enabled: &BTreeSet<DatabaseKind>,
+    log: &mut LoadLog,
+) -> DatabaseKind {
+    let available = if declared.is_empty() {
+        enabled
+    } else {
+        declared
+    };
+    if let Some(scheme_kind) = url.and_then(DatabaseKind::from_url_scheme) {
+        if available.is_empty() || available.contains(&scheme_kind) {
+            return scheme_kind;
+        }
+        log.push((
+            MessageType::WARNING,
+            format!(
+                "database URL is a {scheme_kind} URL but the sqlx `{}` feature is not enabled \
+                 here; ignoring the scheme",
+                scheme_kind.feature_name()
+            ),
+        ));
+    }
+    DatabaseKind::ALL
+        .into_iter()
+        .find(|kind| declared.contains(kind))
+        .or_else(|| {
+            DatabaseKind::ALL
+                .into_iter()
+                .find(|kind| enabled.contains(kind))
+        })
+        .unwrap_or(global_kind)
+}
+
+/// The migration directories a crate consumes: one per `sqlx::migrate!`
+/// invocation in its sources, resolved the way the macro resolves them
+/// (relative to the crate root, defaulting to the configured migrations
+/// directory). A crate that embeds no migrator gets the configured default,
+/// which is also what sqlx-cli consumes.
+fn migration_dirs_for(crate_root: &Path, config: &SqlxConfig, notes: &mut LoadLog) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let push = |dir: PathBuf, dirs: &mut Vec<PathBuf>| {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+
+    for file in rust_sources(crate_root) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        // Cheap pre-filter before spending a tree-sitter parse.
+        if !text.contains("migrate!") {
+            continue;
+        }
+        for source in embedded::migrate_sources(&text) {
+            match source {
+                MigrateSource::Default => {
+                    push(config.migrations_dir(crate_root), &mut dirs);
+                }
+                MigrateSource::Path(path) => {
+                    if Path::new(&path).is_absolute() {
+                        // The macro itself rejects absolute paths.
+                        notes.push((
+                            MessageType::WARNING,
+                            format!(
+                                "ignoring absolute migrate!() path {path} in {}",
+                                file.display()
+                            ),
+                        ));
+                        continue;
+                    }
+                    push(crate_root.join(&path), &mut dirs);
+                }
+            }
+        }
+    }
+
+    if dirs.is_empty() {
+        dirs.push(config.migrations_dir(crate_root));
+    }
+    dirs
+}
+
+/// Resolves symlinks in `path` so it compares against canonical context
+/// roots. Files that don't exist yet (unsaved buffers) resolve through
+/// their nearest existing ancestor.
+fn normalize(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical;
+    }
+    let mut missing = Vec::new();
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+            let mut resolved = canonical;
+            let existing_len = ancestor.components().count();
+            missing.extend(path.components().skip(existing_len));
+            for component in &missing {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+    }
+    path
+}
+
+/// Every `.rs` file under `dir`, skipping hidden directories and build or
+/// dependency output.
+fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    let mut queue = vec![dir.to_owned()];
+    while let Some(dir) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            let hidden_or_output =
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with('.') || name == "target" || name == "node_modules"
+                    });
+            if hidden_or_output {
+                continue;
+            }
+            if path.is_dir() {
+                queue.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+    sources.sort();
+    sources
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(root: &Path, kind: DatabaseKind) -> DbContext {
+        DbContext {
+            root: root.to_owned(),
+            kind,
+            schema: Schema::default(),
+        }
+    }
+
+    #[test]
+    fn context_routing_picks_the_deepest_containing_crate() {
+        let workspace = Workspace {
+            root: Some(PathBuf::from("/repo")),
+            contexts: vec![
+                context(Path::new("/repo/services"), DatabaseKind::MySql),
+                context(Path::new("/repo/services/api"), DatabaseKind::Postgres),
+                context(Path::new("/repo/tools"), DatabaseKind::Sqlite),
+            ],
+            fallback: context(Path::new("/repo"), DatabaseKind::Sqlite),
+            migration_dirs: Vec::new(),
+        };
+        let uri = |path: &str| Url::from_file_path(path).expect("valid path");
+
+        let api = workspace.context_for(&uri("/repo/services/api/queries/get.sql"));
+        assert_eq!(api.kind, DatabaseKind::Postgres);
+        let services = workspace.context_for(&uri("/repo/services/worker/src/main.rs"));
+        assert_eq!(services.kind, DatabaseKind::MySql);
+        let shared = workspace.context_for(&uri("/repo/docs/example.sql"));
+        assert!(std::ptr::eq(shared, &workspace.fallback));
+    }
+
+    #[test]
+    fn kind_resolution_matches_sqlx_driver_selection() {
+        let mut log = LoadLog::new();
+        let declared: BTreeSet<_> = [DatabaseKind::Sqlite].into();
+        let enabled: BTreeSet<_> = [DatabaseKind::Postgres, DatabaseKind::Sqlite].into();
+
+        // The URL scheme decides when its driver is available.
+        assert_eq!(
+            resolve_kind(
+                Some("sqlite://app.db"),
+                &declared,
+                DatabaseKind::Postgres,
+                &enabled,
+                &mut log
+            ),
+            DatabaseKind::Sqlite
+        );
+        // Without a URL, the member's declared driver beats the workspace
+        // default.
+        assert_eq!(
+            resolve_kind(None, &declared, DatabaseKind::Postgres, &enabled, &mut log),
+            DatabaseKind::Sqlite
+        );
+        // A URL whose driver the member does not enable is ignored, with a
+        // warning.
+        let before = log.len();
+        assert_eq!(
+            resolve_kind(
+                Some("mysql://db/app"),
+                &declared,
+                DatabaseKind::Postgres,
+                &enabled,
+                &mut log
+            ),
+            DatabaseKind::Sqlite
+        );
+        assert_eq!(log.len(), before + 1);
+        // No declared drivers: the workspace-unified set gates the scheme.
+        assert_eq!(
+            resolve_kind(
+                Some("postgres://db/app"),
+                &BTreeSet::new(),
+                DatabaseKind::Sqlite,
+                &enabled,
+                &mut log
+            ),
+            DatabaseKind::Postgres
+        );
+    }
+
+    #[test]
+    fn migration_dirs_follow_migrate_invocations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crate_root = dir.path();
+        std::fs::create_dir_all(crate_root.join("src")).expect("mkdir");
+        std::fs::write(
+            crate_root.join("src").join("main.rs"),
+            r#"fn main() { let _ = sqlx::migrate!("../shared/migrations"); }"#,
+        )
+        .expect("write source");
+
+        let mut notes = LoadLog::new();
+        let config = SqlxConfig::default();
+        let dirs = migration_dirs_for(crate_root, &config, &mut notes);
+        assert_eq!(dirs, vec![crate_root.join("../shared/migrations")]);
+    }
+
+    #[test]
+    fn migration_dirs_default_when_no_migrator_is_embedded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(dir.path().join("src").join("lib.rs"), "pub fn f() {}")
+            .expect("write source");
+
+        let mut notes = LoadLog::new();
+        let config = SqlxConfig::default();
+        let dirs = migration_dirs_for(dir.path(), &config, &mut notes);
+        assert_eq!(dirs, vec![dir.path().join("./migrations")]);
+    }
+
+    /// The end-to-end mixed-backend scenario: one workspace, one postgres
+    /// crate and one sqlite crate, each with its own migrations and
+    /// environment. Exercises `cargo metadata`, per-crate config/env
+    /// discovery, scheme-based kind resolution, and document routing.
+    #[tokio::test]
+    async fn mixed_backend_workspace_builds_isolated_contexts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"pg-svc\", \"lite-svc\"]\n",
+        )
+        .expect("write workspace manifest");
+
+        let write_member = |name: &str, feature: &str| {
+            let member = root.join(name);
+            std::fs::create_dir_all(member.join("src")).expect("mkdir");
+            std::fs::create_dir_all(member.join("migrations")).expect("mkdir");
+            std::fs::write(
+                member.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                     [dependencies]\nsqlx = {{ version = \"=0.9.0\", default-features = false, \
+                     features = [\"{feature}\"] }}\n"
+                ),
+            )
+            .expect("write member manifest");
+            std::fs::write(member.join("src").join("lib.rs"), "").expect("write lib");
+            member
+        };
+
+        let pg = write_member("pg-svc", "postgres");
+        std::fs::write(
+            pg.join("migrations").join("1_users.sql"),
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL);",
+        )
+        .expect("write migration");
+
+        let lite = write_member("lite-svc", "sqlite");
+        std::fs::write(
+            lite.join("migrations").join("1_cache.sql"),
+            "CREATE TABLE cache_entries (key TEXT PRIMARY KEY, value BLOB);",
+        )
+        .expect("write migration");
+        std::fs::write(lite.join(".env"), "DATABASE_URL=sqlite://cache.db\n").expect("write .env");
+
+        let (workspace, log) = Workspace::load(root.to_owned()).await;
+        let dump = || {
+            log.iter()
+                .map(|(_, line)| line.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert_eq!(workspace.contexts.len(), 2, "{}", dump());
+
+        let uri = |path: PathBuf| Url::from_file_path(path).expect("valid path");
+        let pg_context = workspace.context_for(&uri(pg.join("src").join("main.rs")));
+        assert_eq!(pg_context.kind, DatabaseKind::Postgres, "{}", dump());
+        assert!(pg_context.schema.table("users").is_some(), "{}", dump());
+        assert!(pg_context.schema.table("cache_entries").is_none());
+
+        let lite_context = workspace.context_for(&uri(lite.join("queries").join("get.sql")));
+        assert_eq!(lite_context.kind, DatabaseKind::Sqlite, "{}", dump());
+        assert!(lite_context.schema.table("cache_entries").is_some());
+        assert!(lite_context.schema.table("users").is_none());
+
+        // Shared documents outside both crates see the merged view.
+        let shared = workspace.context_for(&uri(root.join("notes.sql")));
+        assert!(shared.schema.table("users").is_some());
+        assert!(shared.schema.table("cache_entries").is_some());
+    }
+}

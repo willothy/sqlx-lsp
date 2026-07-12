@@ -44,66 +44,55 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-/// Reads `DATABASE_URL` the way sqlx does: from the process environment
-/// first, then from the first `.env` file found in `roots` (the workspace
-/// root followed by its member crate directories).
-pub fn discover_database_url<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Option<String> {
-    if let Ok(url) = std::env::var("DATABASE_URL")
-        && !url.is_empty()
-    {
-        return Some(url);
-    }
-    for root in roots {
-        if let Ok(env_file) = std::fs::read_to_string(root.join(".env"))
-            && let Some(url) = EnvFile::new(&env_file).value_of("DATABASE_URL")
-        {
-            return Some(url);
-        }
-    }
-    None
+/// The macro-relevant environment discovered for one crate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MacroEnv {
+    /// The crate's database connection URL, when one is configured.
+    pub database_url: Option<String>,
+    /// Whether `SQLX_OFFLINE` requests that no database be contacted.
+    pub offline: bool,
 }
 
-/// A parsed view over dotenv-style `KEY=VALUE` file contents.
-struct EnvFile<'a> {
-    text: &'a str,
-}
+/// Discovers the environment for the crate rooted at `crate_dir`, matching
+/// sqlx-macros' `load_env`: `.env` files are read (via dotenvy, the parser
+/// sqlx itself uses) from every ancestor of the crate directory, with
+/// entries from outer ancestors overwriting inner ones, and the process
+/// environment overriding them all. An empty URL counts as unset.
+///
+/// `database_url_var` is the crate's URL variable name from its `sqlx.toml`
+/// (`DATABASE_URL` by default). Malformed `.env` lines are skipped rather
+/// than failing the whole discovery; the macros error out there, but an
+/// editor session should degrade instead.
+pub fn discover_macro_env(crate_dir: &Path, database_url_var: &str) -> MacroEnv {
+    let mut database_url = None;
+    let mut offline = None;
 
-impl<'a> EnvFile<'a> {
-    fn new(text: &'a str) -> Self {
-        EnvFile { text }
+    for dir in crate_dir.ancestors() {
+        let path = dir.join(".env");
+        let Ok(entries) = dotenvy::from_path_iter(&path) else {
+            continue;
+        };
+        for (name, value) in entries.flatten() {
+            if name == database_url_var {
+                database_url = Some(value);
+            } else if name == "SQLX_OFFLINE" {
+                offline = Some(value);
+            }
+        }
     }
 
-    /// The value of `key`, with optional `export` prefix and surrounding
-    /// single or double quotes handled.
-    fn value_of(&self, key: &str) -> Option<String> {
-        for line in self.text.lines() {
-            let line = line.trim();
-            let line = line
-                .strip_prefix("export ")
-                .map(str::trim_start)
-                .unwrap_or(line);
-            if line.starts_with('#') {
-                continue;
-            }
-            let Some((name, value)) = line.split_once('=') else {
-                continue;
-            };
-            if name.trim() != key {
-                continue;
-            }
-            let value = value.trim();
-            let unquoted = value
-                .strip_prefix('"')
-                .and_then(|rest| rest.strip_suffix('"'))
-                .or_else(|| {
-                    value
-                        .strip_prefix('\'')
-                        .and_then(|rest| rest.strip_suffix('\''))
-                })
-                .unwrap_or(value);
-            return Some(unquoted.to_owned());
-        }
-        None
+    let database_url = std::env::var(database_url_var)
+        .ok()
+        .or(database_url)
+        .filter(|url| !url.is_empty());
+    let offline = std::env::var("SQLX_OFFLINE")
+        .ok()
+        .or(offline)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
+
+    MacroEnv {
+        database_url,
+        offline,
     }
 }
 
@@ -582,41 +571,51 @@ impl LiveDatabase {
 mod tests {
     use super::*;
 
+    /// A var name no ambient environment plausibly sets, so the `.env` paths
+    /// are testable regardless of the developer's shell.
+    const TEST_VAR: &str = "SQLX_LSP_TEST_DATABASE_URL";
+
     #[test]
-    fn env_file_parsing_handles_quotes_export_and_comments() {
-        let env = EnvFile::new(
-            "# comment\n\
-             export FOO='bar'\n\
-             DATABASE_URL=\"sqlite://db/app.db\"\n\
-             OTHER=x=y\n",
-        );
-        assert_eq!(env.value_of("FOO").as_deref(), Some("bar"));
-        assert_eq!(
-            env.value_of("DATABASE_URL").as_deref(),
-            Some("sqlite://db/app.db")
-        );
-        assert_eq!(env.value_of("OTHER").as_deref(), Some("x=y"));
-        assert_eq!(env.value_of("MISSING"), None);
+    fn macro_env_walks_ancestors_with_outer_wins_precedence() {
+        // sqlx-macros' load_env visits every ancestor's .env and later
+        // (outer) files overwrite earlier ones; the crate's own .env loses
+        // to the workspace root's. Surprising, but matched deliberately.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crate_dir = dir.path().join("repo").join("backend");
+        std::fs::create_dir_all(&crate_dir).expect("mkdir");
+        std::fs::write(
+            crate_dir.join(".env"),
+            format!("{TEST_VAR}=sqlite://inner.db\n"),
+        )
+        .expect("write inner .env");
+
+        let env = discover_macro_env(&crate_dir, TEST_VAR);
+        assert_eq!(env.database_url.as_deref(), Some("sqlite://inner.db"));
+
+        std::fs::write(
+            dir.path().join("repo").join(".env"),
+            format!("{TEST_VAR}=sqlite://outer.db\n"),
+        )
+        .expect("write outer .env");
+        let env = discover_macro_env(&crate_dir, TEST_VAR);
+        assert_eq!(env.database_url.as_deref(), Some("sqlite://outer.db"));
     }
 
     #[test]
-    fn database_url_is_discovered_across_search_roots() {
-        // The ambient environment shadows .env files by design; the .env
-        // path can only be asserted when the variable is unset.
-        if std::env::var("DATABASE_URL").is_ok() {
+    fn macro_env_treats_empty_urls_as_unset_and_reads_offline() {
+        if std::env::var("SQLX_OFFLINE").is_ok() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo_root = dir.path().join("repo");
-        let crate_root = repo_root.join("backend");
-        std::fs::create_dir_all(&crate_root).expect("mkdir");
-        std::fs::write(crate_root.join(".env"), "DATABASE_URL=sqlite://app.db\n")
-            .expect("write .env");
+        std::fs::write(
+            dir.path().join(".env"),
+            format!("{TEST_VAR}=''\nSQLX_OFFLINE=true\n"),
+        )
+        .expect("write .env");
 
-        // Not at the first root, found at the member crate root.
-        let url = discover_database_url([repo_root.as_path(), crate_root.as_path()]);
-        assert_eq!(url.as_deref(), Some("sqlite://app.db"));
-        assert_eq!(discover_database_url([repo_root.as_path()]), None);
+        let env = discover_macro_env(dir.path(), TEST_VAR);
+        assert_eq!(env.database_url, None);
+        assert!(env.offline);
     }
 
     #[test]

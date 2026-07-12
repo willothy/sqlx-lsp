@@ -1,7 +1,5 @@
 //! The language server backend.
 
-use std::path::PathBuf;
-
 use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::{
@@ -19,11 +17,9 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer, jsonrpc};
 
 use crate::analysis::{completion, definition, hover, semantic_tokens};
-use crate::db::{DatabaseKind, Detection};
 use crate::document::Document;
 use crate::embedded;
-use crate::introspect::{self, LiveDatabase};
-use crate::schema::Schema;
+use crate::workspace::Workspace;
 
 /// How an open document is served: as a SQL file, or as a Rust file whose
 /// sqlx query macros embed SQL.
@@ -53,204 +49,6 @@ impl DocumentLanguage {
 struct OpenDocument {
     document: Document,
     language: DocumentLanguage,
-}
-
-/// Workspace-level state derived from configuration and schema sources on
-/// disk. Rebuilt whenever migrations, `Cargo.toml`, or `.env` change.
-pub struct Workspace {
-    /// The workspace root, when the client provided one.
-    pub root: Option<PathBuf>,
-    /// The database backend detected from the `sqlx` dependency features.
-    pub kind: DatabaseKind,
-    /// The schema index for the workspace's database.
-    pub schema: Schema,
-}
-
-impl Default for Workspace {
-    fn default() -> Self {
-        Workspace {
-            root: None,
-            // SQL parsing needs *a* dialect even before (or without)
-            // successful detection; SQLite is the most permissive of the
-            // supported set and this server's primary target.
-            kind: DatabaseKind::Sqlite,
-            schema: Schema::default(),
-        }
-    }
-}
-
-impl Workspace {
-    /// Rebuilds the workspace state for `root`: re-detects the database
-    /// backend, replays migrations, and (for SQLite) introspects the live
-    /// database. Failures degrade to the previous or default state per
-    /// component and are reported in the returned log lines.
-    async fn load(root: PathBuf) -> (Workspace, Vec<(MessageType, String)>) {
-        let mut log = Vec::new();
-
-        let detection_root = root.clone();
-        let detection =
-            tokio::task::spawn_blocking(move || Detection::detect(&detection_root)).await;
-        let mut member_roots = Vec::new();
-        let mut enabled = std::collections::BTreeSet::new();
-        let mut kind = match detection {
-            Ok(Ok(detection)) => {
-                member_roots = detection.member_roots.clone();
-                enabled = detection.enabled.clone();
-                if detection.enabled.len() > 1 {
-                    log.push((
-                        MessageType::WARNING,
-                        format!(
-                            "multiple sqlx driver features enabled ({}); using {}",
-                            detection
-                                .enabled
-                                .iter()
-                                .map(|kind| kind.feature_name())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            detection.kind
-                        ),
-                    ));
-                }
-                log.push((
-                    MessageType::INFO,
-                    format!("detected database backend: {}", detection.kind),
-                ));
-                detection.kind
-            }
-            Ok(Err(error)) => {
-                log.push((
-                    MessageType::WARNING,
-                    format!("database detection failed ({error}); defaulting to SQLite"),
-                ));
-                DatabaseKind::Sqlite
-            }
-            Err(join_error) => {
-                log.push((
-                    MessageType::ERROR,
-                    format!("database detection task failed: {join_error}"),
-                ));
-                DatabaseKind::Sqlite
-            }
-        };
-
-        // Editors often use the repository root as the LSP workspace root
-        // while migrations and `.env` files live next to the crate manifests
-        // below it, so every member crate directory is a search root too.
-        let mut search_roots = vec![root.clone()];
-        for member in member_roots {
-            if !search_roots.contains(&member) {
-                search_roots.push(member);
-            }
-        }
-
-        // The database URL, when present, decides the backend the same way
-        // the sqlx macros select a driver: by URL scheme, gated on the
-        // driver feature being enabled. Feature priority is only the
-        // fallback for workspaces with no URL.
-        let database_url =
-            introspect::discover_database_url(search_roots.iter().map(PathBuf::as_path));
-        if let Some(url) = &database_url
-            && let Some(scheme_kind) = DatabaseKind::from_url_scheme(url)
-            && scheme_kind != kind
-        {
-            if enabled.is_empty() || enabled.contains(&scheme_kind) {
-                log.push((
-                    MessageType::INFO,
-                    format!("DATABASE_URL scheme selects {scheme_kind}"),
-                ));
-                kind = scheme_kind;
-            } else {
-                log.push((
-                    MessageType::WARNING,
-                    format!(
-                        "DATABASE_URL is a {scheme_kind} URL but the sqlx `{}` feature is not \
-                         enabled; staying on {kind}",
-                        scheme_kind.feature_name()
-                    ),
-                ));
-            }
-        }
-
-        let load_roots = search_roots.clone();
-        let schema_result = tokio::task::spawn_blocking(move || {
-            let mut schema = Schema::default();
-            let mut loaded = Vec::new();
-            let mut failed = Vec::new();
-            for dir in load_roots {
-                let migrations = dir.join("migrations");
-                if !migrations.is_dir() {
-                    continue;
-                }
-                match schema.apply_migrations(&migrations, kind) {
-                    Ok(()) => loaded.push(migrations),
-                    Err(error) => failed.push((migrations, error)),
-                }
-            }
-            (schema, loaded, failed)
-        })
-        .await;
-        let mut schema = match schema_result {
-            Ok((schema, loaded, failed)) => {
-                for migrations in loaded {
-                    log.push((
-                        MessageType::INFO,
-                        format!("replayed migrations from {}", migrations.display()),
-                    ));
-                }
-                for (migrations, error) in failed {
-                    log.push((
-                        MessageType::WARNING,
-                        format!(
-                            "failed to load migrations from {}: {error}",
-                            migrations.display()
-                        ),
-                    ));
-                }
-                schema
-            }
-            Err(join_error) => {
-                log.push((
-                    MessageType::ERROR,
-                    format!("migration loading task failed: {join_error}"),
-                ));
-                Schema::default()
-            }
-        };
-
-        if let Some(url) = database_url {
-            match LiveDatabase::from_url(&url, kind, &root) {
-                Ok(database) => match database.introspect().await {
-                    Ok(tables) => {
-                        log.push((
-                            MessageType::INFO,
-                            format!(
-                                "introspected {} relation(s) from {}",
-                                tables.len(),
-                                database.describe()
-                            ),
-                        ));
-                        schema.merge_database_tables(tables);
-                    }
-                    Err(error) => log.push((MessageType::INFO, error.to_string())),
-                },
-                Err(error) => log.push((MessageType::INFO, error.to_string())),
-            }
-        }
-
-        log.push((
-            MessageType::INFO,
-            format!("schema index holds {} relation(s)", schema.tables().count()),
-        ));
-
-        (
-            Workspace {
-                root: Some(root),
-                kind,
-                schema,
-            },
-            log,
-        )
-    }
 }
 
 /// The tower-lsp backend serving SQL language features.
@@ -292,17 +90,36 @@ impl Backend {
     }
 
     /// Whether a changed file affects workspace state (migrations, manifest,
-    /// or environment) rather than just an open document.
-    fn affects_workspace(uri: &Url) -> bool {
+    /// configuration, or environment) rather than just an open document.
+    async fn affects_workspace(&self, uri: &Url) -> bool {
         let Ok(path) = uri.to_file_path() else {
             return false;
         };
-        let is_migration = path.extension().is_some_and(|ext| ext == "sql")
-            && path
-                .components()
-                .any(|component| component.as_os_str() == "migrations");
         let file_name = path.file_name().and_then(|name| name.to_str());
-        is_migration || matches!(file_name, Some("Cargo.toml") | Some(".env"))
+        if matches!(
+            file_name,
+            Some("Cargo.toml") | Some(".env") | Some("sqlx.toml")
+        ) {
+            return true;
+        }
+        if path.extension().is_none_or(|extension| extension != "sql") {
+            return false;
+        }
+        // Conventional migration directories, plus whichever directories the
+        // loaded contexts actually consume (migrate!() targets and sqlx.toml
+        // overrides).
+        if path
+            .components()
+            .any(|component| component.as_os_str() == "migrations")
+        {
+            return true;
+        }
+        self.workspace
+            .read()
+            .await
+            .migration_dirs
+            .iter()
+            .any(|dir| path.starts_with(dir))
     }
 }
 
@@ -359,13 +176,18 @@ impl LanguageServer for Backend {
         // Watch the files the schema index is derived from. Clients without
         // dynamic-registration support reject this; the did_save fallback
         // still keeps the index fresh for files edited in the editor.
-        let watchers = ["**/migrations/**/*.sql", "**/Cargo.toml", "**/.env"]
-            .into_iter()
-            .map(|glob| FileSystemWatcher {
-                glob_pattern: GlobPattern::String(glob.to_owned()),
-                kind: None,
-            })
-            .collect();
+        let watchers = [
+            "**/migrations/**/*.sql",
+            "**/Cargo.toml",
+            "**/sqlx.toml",
+            "**/.env",
+        ]
+        .into_iter()
+        .map(|glob| FileSystemWatcher {
+            glob_pattern: GlobPattern::String(glob.to_owned()),
+            kind: None,
+        })
+        .collect();
         let options = DidChangeWatchedFilesRegistrationOptions { watchers };
         let registration = Registration {
             id: "sqlx-lsp.watched-files".to_owned(),
@@ -421,7 +243,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        if Self::affects_workspace(&params.text_document.uri) {
+        if self.affects_workspace(&params.text_document.uri).await {
             self.reload_workspace().await;
         }
     }
@@ -439,18 +261,19 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let workspace = self.workspace.read().await;
+        let context = workspace.context_for(&position_params.text_document.uri);
         let items = match open.language {
             DocumentLanguage::Sql => completion::completions(
                 &open.document,
                 position_params.position,
-                &workspace.schema,
-                workspace.kind,
+                &context.schema,
+                context.kind,
             ),
             DocumentLanguage::Rust => embedded::completions(
                 &open.document,
                 position_params.position,
-                &workspace.schema,
-                workspace.kind,
+                &context.schema,
+                context.kind,
             ),
         };
         if items.is_empty() {
@@ -468,18 +291,19 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let workspace = self.workspace.read().await;
+        let context = workspace.context_for(&position_params.text_document.uri);
         let location = match open.language {
             DocumentLanguage::Sql => definition::definition(
                 &open.document,
                 position_params.position,
-                &workspace.schema,
-                workspace.kind,
+                &context.schema,
+                context.kind,
             ),
             DocumentLanguage::Rust => embedded::definition(
                 &open.document,
                 position_params.position,
-                &workspace.schema,
-                workspace.kind,
+                &context.schema,
+                context.kind,
             ),
         };
         Ok(location.map(GotoDefinitionResponse::Scalar))
@@ -491,18 +315,19 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let workspace = self.workspace.read().await;
+        let context = workspace.context_for(&position_params.text_document.uri);
         Ok(match open.language {
             DocumentLanguage::Sql => hover::hover(
                 &open.document,
                 position_params.position,
-                &workspace.schema,
-                workspace.kind,
+                &context.schema,
+                context.kind,
             ),
             DocumentLanguage::Rust => embedded::hover(
                 &open.document,
                 position_params.position,
-                &workspace.schema,
-                workspace.kind,
+                &context.schema,
+                context.kind,
             ),
         })
     }
@@ -514,7 +339,12 @@ impl LanguageServer for Backend {
         let Some(open) = self.documents.get(&params.text_document.uri) else {
             return Ok(None);
         };
-        let kind = self.workspace.read().await.kind;
+        let kind = self
+            .workspace
+            .read()
+            .await
+            .context_for(&params.text_document.uri)
+            .kind;
         let data = match open.language {
             DocumentLanguage::Sql => semantic_tokens::semantic_tokens(&open.document, kind),
             DocumentLanguage::Rust => embedded::embedded_semantic_tokens(&open.document, kind),
@@ -526,12 +356,11 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        if params
-            .changes
-            .iter()
-            .any(|change| Self::affects_workspace(&change.uri))
-        {
-            self.reload_workspace().await;
+        for change in &params.changes {
+            if self.affects_workspace(&change.uri).await {
+                self.reload_workspace().await;
+                return;
+            }
         }
     }
 }
