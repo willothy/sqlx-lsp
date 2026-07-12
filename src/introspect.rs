@@ -178,8 +178,10 @@ impl SqliteDatabase {
     /// followed by `?<params>`. In-memory databases are rejected since there
     /// is nothing durable to introspect.
     pub fn from_url(url: &str, root: &Path) -> Result<SqliteDatabase, IntrospectError> {
+        // The URL may be a network backend's (with credentials) handed to the
+        // wrong parser; never echo it back unredacted.
         let unsupported = || IntrospectError::UnsupportedUrl {
-            url: url.to_owned(),
+            url: redact_url(url),
         };
         let rest = url
             .strip_prefix("sqlite://")
