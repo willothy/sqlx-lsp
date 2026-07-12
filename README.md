@@ -14,12 +14,24 @@ index from your migrations, and serves editor features against that schema.
   via `cargo metadata`. `sqlite`, `postgres`, and `mysql` select the matching
   SQL dialect for parsing; when several are enabled the server prefers
   `postgres` > `mysql` > `sqlite` and logs the ambiguity.
-- **Schema index** — replays the `.sql` migrations under each crate's
-  `migrations/` directory in sqlx version order (skipping `*.down.sql`),
-  applying `CREATE TABLE`, `CREATE VIEW`, `ALTER TABLE`, and `DROP`
-  statements. Definitions keep their source locations. Monorepos work: the
-  server resolves the cargo workspace members below the editor's root and
-  searches every member crate for migrations and `.env`. If `DATABASE_URL` (from the environment or `.env`) points
+- **Per-crate database contexts** — the server mirrors how the sqlx macros
+  resolve everything relative to the invoking crate. Each workspace member
+  that depends on sqlx gets its own context: its `sqlx.toml`
+  (`database-url-var`, `migrations-dir`), its environment (the crate's URL
+  variable from the process environment or ancestor `.env` files, parsed
+  with dotenvy exactly like sqlx), its backend (the URL scheme decides,
+  gated on the enabled driver features — `postgres`/`postgresql`,
+  `mysql`/`mariadb`, `sqlite` — with declared features as the fallback),
+  and its migrations (every `sqlx::migrate!()` target found in its sources,
+  defaulting to the configured migrations directory). A workspace mixing a
+  postgres crate and a sqlite crate serves each crate's SQL against the
+  right schema and dialect. Documents outside any sqlx crate get a
+  workspace-wide context that merges everything. `SQLX_OFFLINE=true`
+  disables live introspection for a context, matching the macros' contract.
+- **Schema index** — replays the `.sql` migrations a crate consumes in sqlx
+  version order (skipping `*.down.sql`), applying `CREATE TABLE`,
+  `CREATE VIEW`, `ALTER TABLE`, and `DROP` statements. Definitions keep
+  their source locations. If `DATABASE_URL` (from the environment or `.env`) points
   at a reachable database, the server also introspects it and fills in any
   relations the migrations don't cover. SQLite files are opened read-only;
   PostgreSQL is queried through its system catalogs on a session forced to
@@ -98,12 +110,14 @@ to adjust verbosity. Schema loading progress is also reported through
 
 ## How detection works
 
-`cargo metadata` resolves the full dependency graph, and the server unions
-the enabled features across every `sqlx` node in the resolve graph. This is
-the same feature set the sqlx macros compile against, so the dialect matches
-what your queries actually run under. If detection fails (not a Rust
-workspace, no `sqlx` dependency, no driver feature), the server logs a
-warning and defaults to SQLite.
+`cargo metadata` resolves the full dependency graph (scanning downward for
+the manifest when the editor root is a plain monorepo root). Per crate, the
+backend is chosen the way the sqlx macros select a driver: the crate's
+database URL scheme decides, gated on the driver features its declared sqlx
+dependency (or the workspace-unified feature set) enables; without a URL,
+the highest-priority enabled driver wins (postgres > mysql > sqlite). If
+detection fails entirely (not a Rust workspace, no `sqlx` dependency), the
+server logs a warning and defaults to SQLite.
 
 ## Development
 
