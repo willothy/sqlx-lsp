@@ -270,6 +270,7 @@ pub fn completions(
         &parsed,
         region.to_embedded(position),
         schema,
+        kind,
     )
 }
 

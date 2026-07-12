@@ -323,6 +323,7 @@ impl LanguageServer for Backend {
                     &parsed,
                     position_params.position,
                     &context.schema,
+                    context.kind,
                 )
             }
             DocumentLanguage::Rust => {

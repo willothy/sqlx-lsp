@@ -13,6 +13,7 @@ use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, Position, Range,
 };
 
+use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::parse::ParsedSql;
 use crate::schema::{Column, Schema, Table, TableKind};
@@ -56,7 +57,6 @@ const KEYWORDS: &[&str] = &[
     "UPDATE",
     "SET",
     "DELETE FROM",
-    "RETURNING",
     "WITH",
     "CREATE TABLE",
     "CREATE VIEW",
@@ -276,8 +276,18 @@ fn column_item(table: &Table, column: &Column, sort_group: char) -> CompletionIt
     }
 }
 
-fn keyword_items(items: &mut Vec<CompletionItem>) {
-    items.extend(KEYWORDS.iter().map(|keyword| CompletionItem {
+/// Keywords specific to one backend's SQL flavor.
+fn dialect_keywords(kind: DatabaseKind) -> &'static [&'static str] {
+    match kind {
+        DatabaseKind::Postgres => &["ILIKE", "ON CONFLICT", "RETURNING"],
+        DatabaseKind::MySql => &["AUTO_INCREMENT", "ON DUPLICATE KEY UPDATE"],
+        DatabaseKind::Sqlite => &["AUTOINCREMENT", "ON CONFLICT", "RETURNING"],
+    }
+}
+
+fn keyword_items(items: &mut Vec<CompletionItem>, kind: DatabaseKind) {
+    let keywords = KEYWORDS.iter().chain(dialect_keywords(kind));
+    items.extend(keywords.map(|keyword| CompletionItem {
         label: (*keyword).to_owned(),
         kind: Some(CompletionItemKind::KEYWORD),
         sort_text: Some(format!("3{keyword}")),
@@ -291,12 +301,14 @@ fn keyword_items(items: &mut Vec<CompletionItem>) {
     }));
 }
 
-/// Computes completion items for `position` in `document`.
+/// Computes completion items for `position` in `document`. `kind` selects
+/// the backend-specific keywords offered in general contexts.
 pub fn completions(
     document: &Document,
     parsed: &ParsedSql,
     position: Position,
     schema: &Schema,
+    kind: DatabaseKind,
 ) -> Vec<CompletionItem> {
     let cursor = Cursor::locate(parsed, document, position);
     let scope = cursor.scope();
@@ -338,7 +350,7 @@ pub fn completions(
             }
             items.extend(seen_columns.into_values());
             items.extend(schema.tables().map(|table| table_item(table, '2')));
-            keyword_items(&mut items);
+            keyword_items(&mut items, kind);
         }
     }
     items
@@ -380,6 +392,7 @@ mod tests {
             &parsed,
             Position::new(line, character),
             &schema(),
+            DatabaseKind::Sqlite,
         )
         .into_iter()
         .map(|item| item.label)
@@ -459,5 +472,30 @@ mod tests {
         let labels = labels_at("|");
         assert!(labels.contains(&"SELECT".to_owned()));
         assert!(labels.contains(&"users".to_owned()));
+    }
+
+    #[test]
+    fn keywords_follow_the_backend_dialect() {
+        let labels_for = |kind: DatabaseKind| {
+            let document = Document::new(String::new());
+            let parsed = ParsedSql::parse(kind.dialect(), document.text());
+            completions(&document, &parsed, Position::new(0, 0), &schema(), kind)
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<Vec<_>>()
+        };
+
+        let sqlite = labels_for(DatabaseKind::Sqlite);
+        assert!(sqlite.contains(&"RETURNING".to_owned()));
+        assert!(sqlite.contains(&"AUTOINCREMENT".to_owned()));
+        assert!(!sqlite.contains(&"AUTO_INCREMENT".to_owned()));
+
+        let mysql = labels_for(DatabaseKind::MySql);
+        assert!(mysql.contains(&"AUTO_INCREMENT".to_owned()));
+        assert!(!mysql.contains(&"RETURNING".to_owned()));
+
+        let postgres = labels_for(DatabaseKind::Postgres);
+        assert!(postgres.contains(&"ILIKE".to_owned()));
+        assert!(postgres.contains(&"RETURNING".to_owned()));
     }
 }
