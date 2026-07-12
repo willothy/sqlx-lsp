@@ -16,7 +16,10 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{Client, LanguageServer, jsonrpc};
 
+use std::sync::{Arc, Mutex};
+
 use crate::analysis::{completion, definition, hover, semantic_tokens};
+use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::embedded::{self, EmbeddedSql};
 use crate::parse::ParsedSql;
@@ -46,10 +49,65 @@ impl DocumentLanguage {
     }
 }
 
-/// An open editor document together with the language it is served as.
+/// An open editor document together with the language it is served as and
+/// lazily computed analyses of its current text.
 struct OpenDocument {
     document: Document,
     language: DocumentLanguage,
+    /// The SQL parse of the current text, keyed by the dialect it was
+    /// parsed under (the context kind can change across reloads).
+    parsed_sql: Mutex<Option<(DatabaseKind, Arc<ParsedSql>)>>,
+    /// The extracted query regions of the current text (Rust documents).
+    extracted: Mutex<Option<Arc<EmbeddedSql>>>,
+}
+
+impl OpenDocument {
+    fn new(document: Document, language: DocumentLanguage) -> OpenDocument {
+        OpenDocument {
+            document,
+            language,
+            parsed_sql: Mutex::new(None),
+            extracted: Mutex::new(None),
+        }
+    }
+
+    /// The parse of the current text under `kind`'s dialect, computed at
+    /// most once per text-and-dialect combination.
+    fn parsed(&self, kind: DatabaseKind) -> Arc<ParsedSql> {
+        let mut cache = self.parsed_sql.lock().expect("parse cache lock poisoned");
+        if let Some((cached_kind, parsed)) = &*cache
+            && *cached_kind == kind
+        {
+            return Arc::clone(parsed);
+        }
+        let parsed = Arc::new(ParsedSql::parse(kind.dialect(), self.document.text()));
+        *cache = Some((kind, Arc::clone(&parsed)));
+        parsed
+    }
+
+    /// The extracted SQL regions of the current text, computed at most once
+    /// per text.
+    fn extracted(&self) -> Arc<EmbeddedSql> {
+        let mut cache = self.extracted.lock().expect("region cache lock poisoned");
+        if let Some(extracted) = &*cache {
+            return Arc::clone(extracted);
+        }
+        let extracted = Arc::new(EmbeddedSql::extract(&self.document));
+        *cache = Some(Arc::clone(&extracted));
+        extracted
+    }
+
+    /// Drops cached analyses after the text changed.
+    fn invalidate(&mut self) {
+        *self
+            .parsed_sql
+            .get_mut()
+            .expect("parse cache lock poisoned") = None;
+        *self
+            .extracted
+            .get_mut()
+            .expect("region cache lock poisoned") = None;
+    }
 }
 
 /// The tower-lsp backend serving SQL language features.
@@ -214,10 +272,7 @@ impl LanguageServer for Backend {
         let language = DocumentLanguage::detect(Some(&document.language_id), &document.uri);
         self.documents.insert(
             document.uri,
-            OpenDocument {
-                document: Document::new(document.text),
-                language,
-            },
+            OpenDocument::new(Document::new(document.text), language),
         );
     }
 
@@ -228,16 +283,14 @@ impl LanguageServer for Backend {
         };
         let uri = params.text_document.uri;
         match self.documents.get_mut(&uri) {
-            Some(mut open) => open.document.update(change.text),
+            Some(mut open) => {
+                open.document.update(change.text);
+                open.invalidate();
+            }
             None => {
                 let language = DocumentLanguage::detect(None, &uri);
-                self.documents.insert(
-                    uri,
-                    OpenDocument {
-                        document: Document::new(change.text),
-                        language,
-                    },
-                );
+                self.documents
+                    .insert(uri, OpenDocument::new(Document::new(change.text), language));
             }
         }
     }
@@ -264,7 +317,7 @@ impl LanguageServer for Backend {
         let context = workspace.context_for(&position_params.text_document.uri);
         let items = match open.language {
             DocumentLanguage::Sql => {
-                let parsed = ParsedSql::parse(context.kind.dialect(), open.document.text());
+                let parsed = open.parsed(context.kind);
                 completion::completions(
                     &open.document,
                     &parsed,
@@ -273,7 +326,7 @@ impl LanguageServer for Backend {
                 )
             }
             DocumentLanguage::Rust => {
-                let extracted = EmbeddedSql::extract(&open.document);
+                let extracted = open.extracted();
                 embedded::completions(
                     &extracted,
                     position_params.position,
@@ -300,7 +353,7 @@ impl LanguageServer for Backend {
         let context = workspace.context_for(&position_params.text_document.uri);
         let location = match open.language {
             DocumentLanguage::Sql => {
-                let parsed = ParsedSql::parse(context.kind.dialect(), open.document.text());
+                let parsed = open.parsed(context.kind);
                 definition::definition(
                     &open.document,
                     &parsed,
@@ -309,7 +362,7 @@ impl LanguageServer for Backend {
                 )
             }
             DocumentLanguage::Rust => {
-                let extracted = EmbeddedSql::extract(&open.document);
+                let extracted = open.extracted();
                 embedded::definition(
                     &extracted,
                     position_params.position,
@@ -330,7 +383,7 @@ impl LanguageServer for Backend {
         let context = workspace.context_for(&position_params.text_document.uri);
         Ok(match open.language {
             DocumentLanguage::Sql => {
-                let parsed = ParsedSql::parse(context.kind.dialect(), open.document.text());
+                let parsed = open.parsed(context.kind);
                 hover::hover(
                     &open.document,
                     &parsed,
@@ -339,7 +392,7 @@ impl LanguageServer for Backend {
                 )
             }
             DocumentLanguage::Rust => {
-                let extracted = EmbeddedSql::extract(&open.document);
+                let extracted = open.extracted();
                 embedded::hover(
                     &extracted,
                     position_params.position,
@@ -365,11 +418,11 @@ impl LanguageServer for Backend {
             .kind;
         let data = match open.language {
             DocumentLanguage::Sql => {
-                let parsed = ParsedSql::parse(kind.dialect(), open.document.text());
+                let parsed = open.parsed(kind);
                 semantic_tokens::semantic_tokens(&open.document, &parsed)
             }
             DocumentLanguage::Rust => {
-                let extracted = EmbeddedSql::extract(&open.document);
+                let extracted = open.extracted();
                 embedded::embedded_semantic_tokens(&extracted, kind)
             }
         };
