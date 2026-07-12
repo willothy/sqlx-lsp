@@ -204,7 +204,11 @@ impl Visitor for References {
                 },
             ),
             Expr::CompoundIdentifier(parts) => {
-                if let [qualifier, column] = parts.as_slice() {
+                // `table.column` or `schema.table.column`: the last part is
+                // the column and the part before it the relation; anything
+                // earlier is a schema/database qualifier the index doesn't
+                // model.
+                if let [.., qualifier, column] = parts.as_slice() {
                     self.record(
                         qualifier.span,
                         CandidateKind::Table {
@@ -345,6 +349,14 @@ mod tests {
         assert_eq!(resolve(sql, 0, 9).as_deref(), Some("column:users.email"));
         // The alias definition itself resolves to the table.
         assert_eq!(resolve(sql, 0, 29).as_deref(), Some("table:users"));
+    }
+
+    #[test]
+    fn resolves_schema_qualified_references() {
+        // `main.users.email`: the middle part is the relation.
+        let sql = "SELECT main.users.email FROM main.users";
+        assert_eq!(resolve(sql, 0, 12).as_deref(), Some("table:users"));
+        assert_eq!(resolve(sql, 0, 18).as_deref(), Some("column:users.email"));
     }
 
     #[test]
