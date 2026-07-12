@@ -121,13 +121,8 @@ pub struct Detection {
     /// Every backend whose driver feature is enabled anywhere in the
     /// workspace (Cargo's unified feature set on the sqlx package).
     pub enabled: BTreeSet<DatabaseKind>,
-    /// Directories of the cargo workspace's member crates, sorted and
-    /// deduplicated. Editors often use a repository root as the LSP
-    /// workspace root; migrations and `.env` files live next to crate
-    /// manifests, so these are the places to look for them.
-    pub member_roots: Vec<PathBuf>,
-    /// The member crates that depend on sqlx directly, in `member_roots`
-    /// order.
+    /// The member crates that depend on sqlx directly, sorted by
+    /// directory.
     pub sqlx_members: Vec<SqlxMember>,
 }
 
@@ -149,14 +144,6 @@ impl Detection {
                     .find(|package| &package.id == member)
             })
             .collect();
-
-        let mut member_roots: Vec<PathBuf> = member_packages
-            .iter()
-            .filter_map(|package| package.manifest_path.parent())
-            .map(|dir| dir.as_std_path().to_owned())
-            .collect();
-        member_roots.sort();
-        member_roots.dedup();
 
         let mut sqlx_members: Vec<SqlxMember> = member_packages
             .iter()
@@ -207,7 +194,6 @@ impl Detection {
             });
 
         let mut detection = Detection::from_features(feature_names)?;
-        detection.member_roots = member_roots;
         detection.sqlx_members = sqlx_members;
         Ok(detection)
     }
@@ -275,7 +261,6 @@ impl Detection {
         Ok(Detection {
             kind,
             enabled,
-            member_roots: Vec::new(),
             sqlx_members: Vec::new(),
         })
     }
@@ -336,8 +321,9 @@ mod tests {
         assert_eq!(detection.kind, DatabaseKind::Postgres);
         assert!(
             detection
-                .member_roots
-                .contains(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+                .sqlx_members
+                .iter()
+                .any(|member| member.root == PathBuf::from(env!("CARGO_MANIFEST_DIR")))
         );
     }
 
