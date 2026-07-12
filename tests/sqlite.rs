@@ -28,7 +28,8 @@ async fn database_with_fixture_schema(dir: &Path) -> PathBuf {
              group_id INTEGER NOT NULL,
              PRIMARY KEY (user_id, group_id)
          );
-         CREATE VIEW user_emails AS SELECT id, email FROM users;",
+         CREATE VIEW user_emails AS SELECT id, email FROM users;
+         CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY);",
     )
     .execute(&mut connection)
     .await
@@ -85,6 +86,9 @@ async fn introspects_tables_views_and_columns() {
         .expect("view");
     assert_eq!(view.kind, TableKind::View);
     assert_eq!(view.columns.len(), 2);
+
+    // sqlx's bookkeeping table is not part of the user's schema.
+    assert!(!tables.iter().any(|table| table.name == "_sqlx_migrations"));
 }
 
 #[tokio::test]

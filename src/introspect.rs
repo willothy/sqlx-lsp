@@ -230,6 +230,7 @@ impl SqliteDatabase {
         let relations = sqlx::query(
             "SELECT name, type FROM sqlite_master \
              WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' \
+               AND name != '_sqlx_migrations' \
              ORDER BY name",
         )
         .fetch_all(&mut connection)
@@ -338,6 +339,7 @@ impl PostgresDatabase {
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('r', 'p', 'v', 'm') \
                AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND c.relname != '_sqlx_migrations' \
                AND pg_catalog.pg_table_is_visible(c.oid) \
              ORDER BY c.relname",
         )
@@ -461,7 +463,7 @@ impl MySqlDatabase {
         let relations = sqlx::query(
             "SELECT TABLE_NAME AS name, TABLE_TYPE AS kind \
              FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = DATABASE() \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME != '_sqlx_migrations' \
              ORDER BY TABLE_NAME",
         )
         .fetch_all(&mut connection)
