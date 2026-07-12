@@ -6,6 +6,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Connection, Row};
 
 use super::{IntrospectError, redact_url};
+use crate::db::DatabaseKind;
 use crate::schema::{Column, Table, TableKind, TableOrigin};
 
 /// A file-backed SQLite database reachable from the workspace.
@@ -24,6 +25,7 @@ impl SqliteDatabase {
         // The URL may be a network backend's (with credentials) handed to the
         // wrong parser; never echo it back unredacted.
         let unsupported = || IntrospectError::UnsupportedUrl {
+            backend: DatabaseKind::Sqlite,
             url: redact_url(url),
         };
         let rest = url
@@ -59,7 +61,8 @@ impl SqliteDatabase {
             });
         }
         let query_error = |source| IntrospectError::Query {
-            path: self.path.clone(),
+            backend: DatabaseKind::Sqlite,
+            target: self.path.display().to_string(),
             source,
         };
 

@@ -7,6 +7,7 @@ use sqlx::postgres::types::Oid;
 use sqlx::{ConnectOptions, Connection, Row};
 
 use super::{IntrospectError, redact_url};
+use crate::db::DatabaseKind;
 use crate::schema::{Column, Table, TableKind, TableOrigin};
 
 /// A PostgreSQL database reachable from the workspace.
@@ -22,12 +23,14 @@ impl PostgresDatabase {
     pub fn from_url(url: &str) -> Result<PostgresDatabase, IntrospectError> {
         if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
             return Err(IntrospectError::UnsupportedUrl {
+                backend: DatabaseKind::Postgres,
                 url: redact_url(url),
             });
         }
         let display_url = redact_url(url);
         let options = PgConnectOptions::from_str(url)
-            .map_err(|source| IntrospectError::PostgresUrl {
+            .map_err(|source| IntrospectError::InvalidUrl {
+                backend: DatabaseKind::Postgres,
                 url: display_url.clone(),
                 source,
             })?
@@ -49,8 +52,9 @@ impl PostgresDatabase {
     /// Reads every table, view, and materialized view visible on the
     /// connection's search path, with columns, from the system catalogs.
     pub async fn introspect(&self) -> Result<Vec<Table>, IntrospectError> {
-        let query_error = |source| IntrospectError::PostgresQuery {
-            url: self.display_url.clone(),
+        let query_error = |source| IntrospectError::Query {
+            backend: DatabaseKind::Postgres,
+            target: self.display_url.clone(),
             source,
         };
 

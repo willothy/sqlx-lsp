@@ -7,6 +7,7 @@ use sqlx::mysql::MySqlConnectOptions;
 use sqlx::{ConnectOptions, Connection, Row};
 
 use super::{IntrospectError, redact_url};
+use crate::db::DatabaseKind;
 use crate::schema::{Column, Table, TableKind, TableOrigin};
 
 /// A MySQL (or MariaDB) database reachable from the workspace.
@@ -24,17 +25,19 @@ impl MySqlDatabase {
     pub fn from_url(url: &str) -> Result<MySqlDatabase, IntrospectError> {
         if !url.starts_with("mysql://") && !url.starts_with("mariadb://") {
             return Err(IntrospectError::UnsupportedUrl {
+                backend: DatabaseKind::MySql,
                 url: redact_url(url),
             });
         }
         let display_url = redact_url(url);
         let options =
-            MySqlConnectOptions::from_str(url).map_err(|source| IntrospectError::MySqlUrl {
+            MySqlConnectOptions::from_str(url).map_err(|source| IntrospectError::InvalidUrl {
+                backend: DatabaseKind::MySql,
                 url: display_url.clone(),
                 source,
             })?;
         if options.get_database().is_none_or(str::is_empty) {
-            return Err(IntrospectError::MySqlMissingDatabase { url: display_url });
+            return Err(IntrospectError::MissingDatabase { url: display_url });
         }
         Ok(MySqlDatabase {
             options,
@@ -50,8 +53,9 @@ impl MySqlDatabase {
     /// Reads every table and view (with columns) of the URL's database from
     /// `information_schema`.
     pub async fn introspect(&self) -> Result<Vec<Table>, IntrospectError> {
-        let query_error = |source| IntrospectError::MySqlQuery {
-            url: self.display_url.clone(),
+        let query_error = |source| IntrospectError::Query {
+            backend: DatabaseKind::MySql,
+            target: self.display_url.clone(),
             source,
         };
 
@@ -142,7 +146,7 @@ mod tests {
 
         assert!(matches!(
             MySqlDatabase::from_url("mysql://root@localhost"),
-            Err(IntrospectError::MySqlMissingDatabase { .. })
+            Err(IntrospectError::MissingDatabase { .. })
         ));
         assert!(matches!(
             MySqlDatabase::from_url("postgres://app@localhost/app"),

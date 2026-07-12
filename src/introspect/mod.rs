@@ -97,69 +97,51 @@ pub fn discover_macro_env(crate_dir: &Path, database_url_var: &str) -> MacroEnv 
     }
 }
 
-/// Failure to introspect a live database.
+/// Failure to introspect a live database. URLs in these errors always have
+/// their password redacted.
 #[derive(Debug, thiserror::Error)]
 pub enum IntrospectError {
-    /// The URL does not describe a file-backed SQLite database.
-    #[error("DATABASE_URL is not a file-backed sqlite database: {url}")]
+    /// The URL does not describe a database the expected backend can open
+    /// (wrong scheme, or an in-memory SQLite database).
+    #[error("cannot introspect {backend} from DATABASE_URL {url}")]
     UnsupportedUrl {
+        /// The backend that rejected the URL.
+        backend: DatabaseKind,
         /// The offending URL.
         url: String,
     },
-    /// The database file does not exist (yet); common in fresh checkouts
-    /// where migrations have never been run.
+    /// The SQLite database file does not exist (yet); common in fresh
+    /// checkouts where migrations have never been run.
     #[error("sqlite database file {path} does not exist")]
     DatabaseMissing {
         /// The resolved database file path.
         path: PathBuf,
     },
+    /// The URL is not a valid connection string for its backend.
+    #[error("invalid {backend} DATABASE_URL {url}: {source}")]
+    InvalidUrl {
+        /// The backend that failed to parse the URL.
+        backend: DatabaseKind,
+        /// The offending URL.
+        url: String,
+        /// The underlying sqlx error.
+        #[source]
+        source: sqlx::Error,
+    },
+    /// The URL names no database, so there is no schema to introspect
+    /// (MySQL scopes relations to a database rather than a search path).
+    #[error("DATABASE_URL must name a database: {url}")]
+    MissingDatabase {
+        /// The offending URL.
+        url: String,
+    },
     /// Connecting to or querying the database failed.
-    #[error("failed to introspect sqlite database {path}: {source}")]
+    #[error("failed to introspect {backend} database {target}: {source}")]
     Query {
-        /// The resolved database file path.
-        path: PathBuf,
-        /// The underlying sqlx error.
-        #[source]
-        source: sqlx::Error,
-    },
-    /// The URL is not a valid PostgreSQL connection string.
-    #[error("invalid postgres DATABASE_URL {url}: {source}")]
-    PostgresUrl {
-        /// The offending URL, with any password redacted.
-        url: String,
-        /// The underlying sqlx error.
-        #[source]
-        source: sqlx::Error,
-    },
-    /// Connecting to or querying the PostgreSQL database failed.
-    #[error("failed to introspect postgres database {url}: {source}")]
-    PostgresQuery {
-        /// The database URL, with any password redacted.
-        url: String,
-        /// The underlying sqlx error.
-        #[source]
-        source: sqlx::Error,
-    },
-    /// The URL is not a valid MySQL connection string.
-    #[error("invalid mysql DATABASE_URL {url}: {source}")]
-    MySqlUrl {
-        /// The offending URL, with any password redacted.
-        url: String,
-        /// The underlying sqlx error.
-        #[source]
-        source: sqlx::Error,
-    },
-    /// The MySQL URL names no database, so there is no schema to introspect.
-    #[error("mysql DATABASE_URL must name a database: {url}")]
-    MySqlMissingDatabase {
-        /// The offending URL, with any password redacted.
-        url: String,
-    },
-    /// Connecting to or querying the MySQL database failed.
-    #[error("failed to introspect mysql database {url}: {source}")]
-    MySqlQuery {
-        /// The database URL, with any password redacted.
-        url: String,
+        /// The backend that failed.
+        backend: DatabaseKind,
+        /// The database file path or connection URL.
+        target: String,
         /// The underlying sqlx error.
         #[source]
         source: sqlx::Error,
