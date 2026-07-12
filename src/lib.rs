@@ -7,6 +7,7 @@
 //! (for SQLite) live database introspection.
 
 pub mod analysis;
+pub mod config;
 pub mod db;
 pub mod document;
 pub mod embedded;
