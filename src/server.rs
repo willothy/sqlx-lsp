@@ -11,11 +11,12 @@ use tower_lsp::lsp_types::{
     MessageType, OneOf, Registration, SemanticTokens, SemanticTokensFullOptions,
     SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
-    WorkDoneProgressOptions,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Unregistration,
+    Url, WorkDoneProgressOptions,
 };
 use tower_lsp::{Client, LanguageServer, jsonrpc};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::analysis::{completion, definition, hover, semantic_tokens};
@@ -115,6 +116,9 @@ pub struct Backend {
     client: Client,
     documents: DashMap<Url, OpenDocument>,
     workspace: RwLock<Workspace>,
+    /// Set once the client rejects dynamic watcher registration, so reloads
+    /// stop retrying (the did_save fallback covers those clients).
+    watchers_unavailable: AtomicBool,
 }
 
 impl Backend {
@@ -124,11 +128,13 @@ impl Backend {
             client,
             documents: DashMap::new(),
             workspace: RwLock::new(Workspace::default()),
+            watchers_unavailable: AtomicBool::new(false),
         }
     }
 
-    /// Rebuilds workspace state and forwards the resulting log lines to the
-    /// client.
+    /// Rebuilds workspace state, forwards the resulting log lines to the
+    /// client, and refreshes the file watchers to cover the migration
+    /// directories the new state actually consumes.
     async fn reload_workspace(&self) {
         let root = self.workspace.read().await.root.clone();
         let Some(root) = root else {
@@ -145,6 +151,58 @@ impl Backend {
         *self.workspace.write().await = workspace;
         for (message_type, message) in log {
             self.client.log_message(message_type, message).await;
+        }
+        self.register_watchers().await;
+    }
+
+    /// (Re)registers the watched-file globs: the conventional schema sources
+    /// plus a glob per migration directory currently in use, so custom
+    /// `migrate!()` targets and `sqlx.toml` overrides reload on change too.
+    async fn register_watchers(&self) {
+        if self.watchers_unavailable.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut globs = vec![
+            "**/migrations/**/*.sql".to_owned(),
+            "**/Cargo.toml".to_owned(),
+            "**/sqlx.toml".to_owned(),
+            "**/.env".to_owned(),
+        ];
+        for dir in &self.workspace.read().await.migration_dirs {
+            globs.push(format!("{}/**/*.sql", dir.display()));
+        }
+        let watchers = globs
+            .into_iter()
+            .map(|glob| FileSystemWatcher {
+                glob_pattern: GlobPattern::String(glob),
+                kind: None,
+            })
+            .collect();
+
+        // Replace any previous registration under the same id; clients that
+        // have nothing registered yet simply reject the unregistration.
+        let _ = self
+            .client
+            .unregister_capability(vec![Unregistration {
+                id: "sqlx-lsp.watched-files".to_owned(),
+                method: "workspace/didChangeWatchedFiles".to_owned(),
+            }])
+            .await;
+        let options = DidChangeWatchedFilesRegistrationOptions { watchers };
+        let registration = Registration {
+            id: "sqlx-lsp.watched-files".to_owned(),
+            method: "workspace/didChangeWatchedFiles".to_owned(),
+            register_options: serde_json::to_value(options).ok(),
+        };
+        if let Err(error) = self.client.register_capability(vec![registration]).await {
+            self.watchers_unavailable.store(true, Ordering::Relaxed);
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("file watching unavailable ({error}); relying on saves"),
+                )
+                .await;
         }
     }
 
@@ -230,37 +288,10 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _params: InitializedParams) {
+        // Loads the workspace and registers the file watchers derived from
+        // it. Clients without dynamic-registration support reject the
+        // watchers; the did_save fallback still keeps the index fresh.
         self.reload_workspace().await;
-
-        // Watch the files the schema index is derived from. Clients without
-        // dynamic-registration support reject this; the did_save fallback
-        // still keeps the index fresh for files edited in the editor.
-        let watchers = [
-            "**/migrations/**/*.sql",
-            "**/Cargo.toml",
-            "**/sqlx.toml",
-            "**/.env",
-        ]
-        .into_iter()
-        .map(|glob| FileSystemWatcher {
-            glob_pattern: GlobPattern::String(glob.to_owned()),
-            kind: None,
-        })
-        .collect();
-        let options = DidChangeWatchedFilesRegistrationOptions { watchers };
-        let registration = Registration {
-            id: "sqlx-lsp.watched-files".to_owned(),
-            method: "workspace/didChangeWatchedFiles".to_owned(),
-            register_options: serde_json::to_value(options).ok(),
-        };
-        if let Err(error) = self.client.register_capability(vec![registration]).await {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("file watching unavailable ({error}); relying on saves"),
-                )
-                .await;
-        }
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
