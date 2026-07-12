@@ -43,7 +43,7 @@ mod tests {
     }
 
     fn definition_at(schema: &Schema, sql: &str, character: u32) -> Option<Location> {
-        let document = Document::new(sql.to_owned(), 0);
+        let document = Document::new(sql.to_owned());
         definition(
             &document,
             Position::new(0, character),

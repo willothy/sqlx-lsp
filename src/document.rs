@@ -9,11 +9,10 @@
 use sqlparser::tokenizer::{Location as SqlLocation, Span as SqlSpan};
 use tower_lsp::lsp_types::{Position, Range};
 
-/// The text and version of one open document.
+/// The text of one open document.
 #[derive(Debug, Clone)]
 pub struct Document {
     text: String,
-    version: i32,
     /// Byte offset of the first character of each line. Always non-empty;
     /// `line_starts[0]` is `0`.
     line_starts: Vec<usize>,
@@ -21,30 +20,20 @@ pub struct Document {
 
 impl Document {
     /// Creates a document from its full text.
-    pub fn new(text: String, version: i32) -> Self {
+    pub fn new(text: String) -> Self {
         let line_starts = Self::compute_line_starts(&text);
-        Document {
-            text,
-            version,
-            line_starts,
-        }
+        Document { text, line_starts }
     }
 
     /// Replaces the document contents (full-text synchronization).
-    pub fn update(&mut self, text: String, version: i32) {
+    pub fn update(&mut self, text: String) {
         self.line_starts = Self::compute_line_starts(&text);
         self.text = text;
-        self.version = version;
     }
 
     /// The current document text.
     pub fn text(&self) -> &str {
         &self.text
-    }
-
-    /// The version reported by the client for the current text.
-    pub fn version(&self) -> i32 {
-        self.version
     }
 
     fn compute_line_starts(text: &str) -> Vec<usize> {
@@ -180,7 +169,7 @@ mod tests {
     use sqlparser::tokenizer::Tokenizer;
 
     fn doc(text: &str) -> Document {
-        Document::new(text.to_owned(), 0)
+        Document::new(text.to_owned())
     }
 
     #[test]

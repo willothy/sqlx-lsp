@@ -214,7 +214,7 @@ impl LanguageServer for Backend {
         self.documents.insert(
             document.uri,
             OpenDocument {
-                document: Document::new(document.text, document.version),
+                document: Document::new(document.text),
                 language,
             },
         );
@@ -226,15 +226,14 @@ impl LanguageServer for Backend {
             return;
         };
         let uri = params.text_document.uri;
-        let version = params.text_document.version;
         match self.documents.get_mut(&uri) {
-            Some(mut open) => open.document.update(change.text, version),
+            Some(mut open) => open.document.update(change.text),
             None => {
                 let language = DocumentLanguage::detect(None, &uri);
                 self.documents.insert(
                     uri,
                     OpenDocument {
-                        document: Document::new(change.text, version),
+                        document: Document::new(change.text),
                         language,
                     },
                 );

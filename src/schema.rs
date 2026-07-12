@@ -288,7 +288,7 @@ impl Schema {
     /// is provided, definitions are recorded with source locations.
     pub fn apply_sql(&mut self, sql: &str, kind: DatabaseKind, uri: Option<&Url>) {
         let parsed = ParsedSql::parse(kind.dialect(), sql);
-        let document = Document::new(sql.to_owned(), 0);
+        let document = Document::new(sql.to_owned());
         for statement in &parsed.statements {
             self.apply_statement(statement, uri, &document);
         }

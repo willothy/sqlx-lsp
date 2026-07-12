@@ -427,7 +427,7 @@ mod tests {
     }
 
     fn tokens_for(sql: &str) -> Vec<(u32, u32, u32, u32)> {
-        let document = Document::new(sql.to_owned(), 0);
+        let document = Document::new(sql.to_owned());
         decode(&semantic_tokens(&document, DatabaseKind::Sqlite))
     }
 

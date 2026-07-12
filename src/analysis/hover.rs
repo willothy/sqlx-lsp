@@ -76,7 +76,7 @@ mod tests {
             DatabaseKind::Sqlite,
             None,
         );
-        let document = Document::new(sql.to_owned(), 0);
+        let document = Document::new(sql.to_owned());
         let hover = hover(
             &document,
             Position::new(0, character),

@@ -374,7 +374,7 @@ mod tests {
             .unwrap_or(before)
             .encode_utf16()
             .count() as u32;
-        let document = Document::new(text, 0);
+        let document = Document::new(text);
         completions(
             &document,
             Position::new(line, character),

@@ -303,7 +303,7 @@ mod tests {
     }
 
     fn resolve(sql: &str, line: u32, character: u32) -> Option<String> {
-        let document = Document::new(sql.to_owned(), 0);
+        let document = Document::new(sql.to_owned());
         let schema = schema();
         resolve_at(
             &document,
