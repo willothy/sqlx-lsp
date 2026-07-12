@@ -208,37 +208,19 @@ impl Detection {
             return root.to_owned();
         }
 
-        let mut current_level = vec![root.to_owned()];
-        for _depth in 0..3 {
-            let mut next_level = Vec::new();
-            for dir in current_level {
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                let mut subdirs: Vec<PathBuf> = entries
-                    .filter_map(|entry| entry.ok())
-                    .map(|entry| entry.path())
-                    .filter(|path| path.is_dir())
-                    .filter(|path| {
-                        !path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                name.starts_with('.') || name == "target" || name == "node_modules"
-                            })
-                    })
-                    .collect();
-                subdirs.sort();
-                for subdir in subdirs {
-                    if subdir.join("Cargo.toml").is_file() {
-                        return subdir;
-                    }
-                    next_level.push(subdir);
-                }
-            }
-            current_level = next_level;
-        }
-        root.to_owned()
+        // Shallowest manifest wins, alphabetically within a depth, matching
+        // a breadth-first scan. The walker respects .gitignore and skips
+        // hidden directories, so vendored and build output stay out.
+        ignore::WalkBuilder::new(root)
+            .max_depth(Some(3))
+            .filter_entry(|entry| entry.file_name() != "node_modules")
+            .build()
+            .filter_map(|entry| entry.ok())
+            .map(ignore::DirEntry::into_path)
+            .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.toml"))
+            .filter_map(|path| path.parent().map(Path::to_owned))
+            .min_by_key(|dir| (dir.components().count(), dir.clone()))
+            .unwrap_or_else(|| root.to_owned())
     }
 
     /// Builds a detection from the set of feature names enabled on the `sqlx`

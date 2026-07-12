@@ -472,33 +472,16 @@ fn normalize(path: PathBuf) -> PathBuf {
     path
 }
 
-/// Every `.rs` file under `dir`, skipping hidden directories and build or
-/// dependency output.
+/// Every `.rs` file under `dir`. The walker respects .gitignore and skips
+/// hidden directories, keeping build and dependency output out.
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {
-    let mut sources = Vec::new();
-    let mut queue = vec![dir.to_owned()];
-    while let Some(dir) = queue.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|entry| entry.ok()) {
-            let path = entry.path();
-            let hidden_or_output =
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with('.') || name == "target" || name == "node_modules"
-                    });
-            if hidden_or_output {
-                continue;
-            }
-            if path.is_dir() {
-                queue.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                sources.push(path);
-            }
-        }
-    }
+    let mut sources: Vec<PathBuf> = ignore::WalkBuilder::new(dir)
+        .filter_entry(|entry| entry.file_name() != "node_modules" && entry.file_name() != "target")
+        .build()
+        .filter_map(|entry| entry.ok())
+        .map(ignore::DirEntry::into_path)
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .collect();
     sources.sort();
     sources
 }
