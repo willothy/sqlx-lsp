@@ -1,10 +1,13 @@
-//! Language server for SQL files in projects using [sqlx](https://github.com/launchbadge/sqlx).
+//! Language server for SQL in projects using [sqlx](https://github.com/launchbadge/sqlx).
 //!
-//! The server determines the database backend (SQLite, PostgreSQL, or MySQL)
-//! from the features enabled on the workspace's `sqlx` dependency and provides
-//! completion, hover, goto definition, and semantic token highlighting for SQL
-//! documents, backed by a schema index built from the project's migrations and
-//! (for SQLite) live database introspection.
+//! The server mirrors how sqlx's compile-time machinery resolves everything
+//! relative to the invoking crate: each sqlx-dependent workspace member gets
+//! its own database context — backend (SQLite, PostgreSQL, or MySQL, decided
+//! by its connection URL scheme gated on the enabled driver features),
+//! migrations, and live introspection. Against those contexts it provides
+//! completion, hover, goto definition, and semantic token highlighting for
+//! `.sql` documents and for the SQL embedded in sqlx query macros in Rust
+//! documents.
 
 pub mod analysis;
 pub mod config;
