@@ -88,22 +88,26 @@ pub struct EmbeddedSql {
     pub regions: Vec<SqlRegion>,
 }
 
+/// Parses Rust source into a tree-sitter tree, or `None` when the runtime
+/// rejects the grammar (an ABI mismatch that pinned versions rule out).
+fn parse_rust(source: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
+        tracing::error!("tree-sitter-rust grammar is incompatible with the runtime");
+        return None;
+    }
+    parser.parse(source, None)
+}
+
 impl EmbeddedSql {
     /// Parses `document` as Rust and extracts the SQL string of every sqlx
     /// query macro invocation. Unparseable input yields whatever regions
     /// tree-sitter's error recovery still exposes.
     pub fn extract(document: &Document) -> EmbeddedSql {
-        let mut parser = Parser::new();
-        if parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .is_err()
-        {
-            // Only possible on an ABI mismatch between the linked grammar
-            // and the tree-sitter runtime, which pinned versions rule out.
-            tracing::error!("tree-sitter-rust grammar is incompatible with the runtime");
-            return EmbeddedSql::default();
-        }
-        let Some(tree) = parser.parse(document.text(), None) else {
+        let Some(tree) = parse_rust(document.text()) else {
             return EmbeddedSql::default();
         };
 
@@ -134,22 +138,21 @@ impl EmbeddedSql {
         self.regions.iter().find(|region| region.contains(position))
     }
 
+    /// The final segment of the invoked macro's name (`query_as` for both
+    /// `query_as!` and `sqlx::query_as!`).
+    fn macro_name<'s>(node: Node<'_>, source: &'s str) -> Option<&'s str> {
+        let name_node = node.child_by_field_name("macro")?;
+        let name_node = match name_node.kind() {
+            "scoped_identifier" => name_node.child_by_field_name("name")?,
+            _ => name_node,
+        };
+        name_node.utf8_text(source.as_bytes()).ok()
+    }
+
     /// Whether the invoked macro is one of sqlx's query macros, either bare
     /// (`query_as!`) or path-qualified (`sqlx::query_as!`).
     fn is_sql_macro(node: Node<'_>, source: &str) -> bool {
-        let Some(name_node) = node.child_by_field_name("macro") else {
-            return false;
-        };
-        let name_node = match name_node.kind() {
-            "scoped_identifier" => match name_node.child_by_field_name("name") {
-                Some(name) => name,
-                None => return false,
-            },
-            _ => name_node,
-        };
-        name_node
-            .utf8_text(source.as_bytes())
-            .is_ok_and(|name| SQL_MACROS.contains(&name))
+        Self::macro_name(node, source).is_some_and(|name| SQL_MACROS.contains(&name))
     }
 
     /// The SQL region of one query macro invocation: the contents of the
@@ -186,6 +189,66 @@ impl EmbeddedSql {
             },
         })
     }
+}
+
+/// One `sqlx::migrate!` invocation found in a Rust source. These are the
+/// code-level bindings between a crate and the migrations it consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrateSource {
+    /// `sqlx::migrate!()` — the crate's configured default directory.
+    Default,
+    /// `sqlx::migrate!("../db/migrations")` — a literal path that the macro
+    /// resolves relative to the crate root.
+    Path(String),
+}
+
+/// Extracts every `sqlx::migrate!` invocation (bare or path-qualified) from
+/// Rust `source`.
+pub fn migrate_sources(source: &str) -> Vec<MigrateSource> {
+    let Some(tree) = parse_rust(source) else {
+        return Vec::new();
+    };
+
+    let mut sources = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "macro_invocation" {
+            if EmbeddedSql::macro_name(node, source) == Some("migrate") {
+                let mut cursor = node.walk();
+                let token_tree = node
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == "token_tree");
+                let literal = token_tree.and_then(|token_tree| {
+                    let mut tokens = token_tree.walk();
+                    token_tree.children(&mut tokens).find(|child| {
+                        matches!(child.kind(), "string_literal" | "raw_string_literal")
+                    })
+                });
+                match literal.and_then(|literal| string_literal_text(literal, source)) {
+                    Some(path) => sources.push(MigrateSource::Path(path)),
+                    None => sources.push(MigrateSource::Default),
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    sources
+}
+
+/// The verbatim text of a string literal node, delimiters excluded.
+fn string_literal_text(literal: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = literal.walk();
+    let mut start = None;
+    let mut end = None;
+    for child in literal.children(&mut cursor) {
+        if matches!(child.kind(), "string_content" | "escape_sequence") {
+            start = Some(start.unwrap_or(child.start_byte()).min(child.start_byte()));
+            end = Some(end.unwrap_or(child.end_byte()).max(child.end_byte()));
+        }
+    }
+    Some(source.get(start?..end?)?.to_owned())
 }
 
 /// Completion items for the SQL region at `position`, if the position is
@@ -387,6 +450,29 @@ fn f() {
     fn broken_rust_still_yields_recoverable_regions() {
         let regions = extract("fn f( { sqlx::query!(\"SELECT 1\") }");
         assert_eq!(regions.len(), 1);
+    }
+
+    #[test]
+    fn migrate_invocations_are_extracted_with_optional_paths() {
+        let source = r#"
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+async fn run(pool: &sqlx::PgPool) {
+    sqlx::migrate!("../db/migrations").run(pool).await.unwrap();
+    migrate!("./other/migrations");
+    println!("migrate!(\"not this one\")");
+}
+"#;
+        let sources = migrate_sources(source);
+        assert_eq!(sources.len(), 3);
+        assert!(sources.contains(&MigrateSource::Default));
+        assert!(sources.contains(&MigrateSource::Path("../db/migrations".to_owned())));
+        assert!(sources.contains(&MigrateSource::Path("./other/migrations".to_owned())));
+    }
+
+    #[test]
+    fn migrate_extraction_ignores_unrelated_sources() {
+        assert!(migrate_sources("fn main() { println!(\"hello\"); }").is_empty());
     }
 
     fn schema() -> Schema {
