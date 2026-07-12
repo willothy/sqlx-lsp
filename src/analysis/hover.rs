@@ -15,13 +15,13 @@ pub fn hover(
     schema: &Schema,
 ) -> Option<Hover> {
     let resolved = resolve_at(document, parsed, position, schema)?;
-    let (value, range) = match resolved {
-        Resolved::Table { table, range } => (table_markdown(table), range),
+    let (value, range) = match &resolved {
+        Resolved::Table { table, range } => (table_markdown(table), *range),
         Resolved::Column {
             table,
             column,
             range,
-        } => (column_markdown(table, column), range),
+        } => (column_markdown(table, column), *range),
     };
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -45,6 +45,7 @@ fn origin_line(origin: TableOrigin, location: Option<&SourceLocation>) -> String
         }
         (TableOrigin::Migration, None) => "*defined in migrations*".to_owned(),
         (TableOrigin::Database, _) => "*from live database*".to_owned(),
+        (TableOrigin::Query, _) => "*defined in this query*".to_owned(),
     }
 }
 

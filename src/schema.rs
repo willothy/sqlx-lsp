@@ -43,6 +43,9 @@ pub enum TableOrigin {
     Migration,
     /// Discovered by introspecting a live database.
     Database,
+    /// Defined by the query being analyzed (a CTE or derived subquery);
+    /// never stored in the schema index.
+    Query,
 }
 
 /// Whether a relation is a table or a view.
@@ -491,12 +494,13 @@ impl Schema {
         self.insert_table(table);
     }
 
-    /// Best-effort column list for the `SELECT` defining a view or a
-    /// `CREATE TABLE ... AS` result. Column references resolve through
-    /// relations already known to the index (retaining their type and
-    /// definition location); wildcards expand through them; expressions
-    /// without an alias are skipped.
-    fn derive_query_columns(&self, query: &Query) -> Vec<Column> {
+    /// Best-effort column list for the `SELECT` defining a view, a
+    /// `CREATE TABLE ... AS` result, or a query-local relation (CTE or
+    /// derived subquery). Column references resolve through relations
+    /// already known to the index (retaining their type and definition
+    /// location); wildcards expand through them; expressions without an
+    /// alias are skipped.
+    pub(crate) fn derive_query_columns(&self, query: &Query) -> Vec<Column> {
         let SetExpr::Select(select) = query.body.as_ref() else {
             return Vec::new();
         };

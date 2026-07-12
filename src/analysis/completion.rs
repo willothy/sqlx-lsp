@@ -312,17 +312,27 @@ pub fn completions(
 ) -> Vec<CompletionItem> {
     let cursor = Cursor::locate(parsed, document, position);
     let scope = cursor.scope();
+    // Relations the document's statements define themselves (CTEs and
+    // derived subqueries). Only available while the statement parses — a
+    // partially typed name after a dot is enough to keep it parseable.
+    let locals = crate::analysis::resolve::query_local_tables(&parsed.statements, schema);
     let resolve_table = |name: &str| {
-        let lowered = name.to_ascii_lowercase();
-        scope
-            .get(&lowered)
-            .and_then(|target| schema.table(target))
-            .or_else(|| schema.table(name))
+        locals
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(name))
+            .or_else(|| {
+                let lowered = name.to_ascii_lowercase();
+                scope
+                    .get(&lowered)
+                    .and_then(|target| schema.table(target))
+                    .or_else(|| schema.table(name))
+            })
     };
 
     let mut items = Vec::new();
     match cursor.context(position) {
         Context::TableName => {
+            items.extend(locals.iter().map(|table| table_item(table, '1')));
             items.extend(schema.tables().map(|table| table_item(table, '1')));
         }
         Context::QualifiedColumn { qualifier } => {
@@ -341,7 +351,7 @@ pub fn completions(
             // Columns of in-scope relations first, then all relations,
             // keywords, and functions; clients filter by typed prefix.
             let mut seen_columns: BTreeMap<String, CompletionItem> = BTreeMap::new();
-            for table in scope.values().filter_map(|name| schema.table(name)) {
+            for table in scope.values().filter_map(|name| resolve_table(name)) {
                 for column in &table.columns {
                     seen_columns
                         .entry(column.name.to_ascii_lowercase())
@@ -471,6 +481,22 @@ mod tests {
     fn empty_document_offers_keywords_and_tables() {
         let labels = labels_at("|");
         assert!(labels.contains(&"SELECT".to_owned()));
+        assert!(labels.contains(&"users".to_owned()));
+    }
+
+    #[test]
+    fn cte_columns_complete_after_a_qualifier() {
+        // The partially typed column keeps the statement parseable, which is
+        // what makes the CTE's derived columns available.
+        let labels =
+            labels_at("WITH recent AS (SELECT id, title FROM posts) SELECT recent.t| FROM recent");
+        assert_eq!(labels, vec!["id".to_owned(), "title".to_owned()]);
+    }
+
+    #[test]
+    fn cte_names_complete_after_from() {
+        let labels = labels_at("WITH recent AS (SELECT id FROM posts) SELECT id FROM re|");
+        assert!(labels.contains(&"recent".to_owned()));
         assert!(labels.contains(&"users".to_owned()));
     }
 
