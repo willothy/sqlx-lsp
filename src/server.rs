@@ -91,9 +91,11 @@ impl Workspace {
         let detection =
             tokio::task::spawn_blocking(move || Detection::detect(&detection_root)).await;
         let mut member_roots = Vec::new();
-        let kind = match detection {
+        let mut enabled = std::collections::BTreeSet::new();
+        let mut kind = match detection {
             Ok(Ok(detection)) => {
                 member_roots = detection.member_roots.clone();
+                enabled = detection.enabled.clone();
                 if detection.enabled.len() > 1 {
                     log.push((
                         MessageType::WARNING,
@@ -138,6 +140,34 @@ impl Workspace {
         for member in member_roots {
             if !search_roots.contains(&member) {
                 search_roots.push(member);
+            }
+        }
+
+        // The database URL, when present, decides the backend the same way
+        // the sqlx macros select a driver: by URL scheme, gated on the
+        // driver feature being enabled. Feature priority is only the
+        // fallback for workspaces with no URL.
+        let database_url =
+            introspect::discover_database_url(search_roots.iter().map(PathBuf::as_path));
+        if let Some(url) = &database_url
+            && let Some(scheme_kind) = DatabaseKind::from_url_scheme(url)
+            && scheme_kind != kind
+        {
+            if enabled.is_empty() || enabled.contains(&scheme_kind) {
+                log.push((
+                    MessageType::INFO,
+                    format!("DATABASE_URL scheme selects {scheme_kind}"),
+                ));
+                kind = scheme_kind;
+            } else {
+                log.push((
+                    MessageType::WARNING,
+                    format!(
+                        "DATABASE_URL is a {scheme_kind} URL but the sqlx `{}` feature is not \
+                         enabled; staying on {kind}",
+                        scheme_kind.feature_name()
+                    ),
+                ));
             }
         }
 
@@ -187,9 +217,7 @@ impl Workspace {
             }
         };
 
-        if let Some(url) =
-            introspect::discover_database_url(search_roots.iter().map(PathBuf::as_path))
-        {
+        if let Some(url) = database_url {
             match LiveDatabase::from_url(&url, kind, &root) {
                 Ok(database) => match database.introspect().await {
                     Ok(tables) => {

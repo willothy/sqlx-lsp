@@ -422,11 +422,11 @@ pub struct MySqlDatabase {
 }
 
 impl MySqlDatabase {
-    /// Parses a `mysql://` connection URL. The URL must name a database:
-    /// MySQL scopes relations to a database rather than a search path, so
-    /// without one there is nothing to introspect.
+    /// Parses a `mysql://` or `mariadb://` connection URL. The URL must name
+    /// a database: MySQL scopes relations to a database rather than a search
+    /// path, so without one there is nothing to introspect.
     pub fn from_url(url: &str) -> Result<MySqlDatabase, IntrospectError> {
-        if !url.starts_with("mysql://") {
+        if !url.starts_with("mysql://") && !url.starts_with("mariadb://") {
             return Err(IntrospectError::UnsupportedUrl {
                 url: redact_url(url),
             });
@@ -728,6 +728,10 @@ mod tests {
             MySqlDatabase::from_url("postgres://app@localhost/app"),
             Err(IntrospectError::UnsupportedUrl { .. })
         ));
+
+        // MariaDB URLs use the MySQL driver, matching sqlx's URL schemes.
+        let database = MySqlDatabase::from_url("mariadb://app@db.example.com/app").expect("valid");
+        assert_eq!(database.display_url(), "mariadb://app@db.example.com/app");
     }
 
     #[test]

@@ -39,6 +39,19 @@ impl DatabaseKind {
         DatabaseKind::Sqlite,
     ];
 
+    /// The backend a connection URL targets, judged by its scheme the same
+    /// way the sqlx macros select a driver: `postgres`/`postgresql`,
+    /// `mysql`/`mariadb`, and `sqlite`.
+    pub fn from_url_scheme(url: &str) -> Option<DatabaseKind> {
+        let (scheme, _) = url.split_once(':')?;
+        match scheme.to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Some(DatabaseKind::Postgres),
+            "mysql" | "mariadb" => Some(DatabaseKind::MySql),
+            "sqlite" => Some(DatabaseKind::Sqlite),
+            _ => None,
+        }
+    }
+
     /// The sqlx cargo feature that enables this backend's driver.
     pub fn feature_name(self) -> &'static str {
         match self {
@@ -244,6 +257,19 @@ mod tests {
 
         let detection = Detection::from_features(["mysql", "sqlite"]).expect("detects");
         assert_eq!(detection.kind, DatabaseKind::MySql);
+    }
+
+    #[test]
+    fn url_schemes_map_to_backends_like_sqlx_drivers() {
+        let scheme = DatabaseKind::from_url_scheme;
+        assert_eq!(scheme("postgres://h/db"), Some(DatabaseKind::Postgres));
+        assert_eq!(scheme("postgresql://h/db"), Some(DatabaseKind::Postgres));
+        assert_eq!(scheme("mysql://h/db"), Some(DatabaseKind::MySql));
+        assert_eq!(scheme("mariadb://h/db"), Some(DatabaseKind::MySql));
+        assert_eq!(scheme("sqlite:app.db"), Some(DatabaseKind::Sqlite));
+        assert_eq!(scheme("sqlite://app.db"), Some(DatabaseKind::Sqlite));
+        assert_eq!(scheme("redis://h"), None);
+        assert_eq!(scheme("not a url"), None);
     }
 
     #[test]
