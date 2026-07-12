@@ -18,7 +18,8 @@ use tower_lsp::{Client, LanguageServer, jsonrpc};
 
 use crate::analysis::{completion, definition, hover, semantic_tokens};
 use crate::document::Document;
-use crate::embedded;
+use crate::embedded::{self, EmbeddedSql};
+use crate::parse::ParsedSql;
 use crate::workspace::Workspace;
 
 /// How an open document is served: as a SQL file, or as a Rust file whose
@@ -262,18 +263,24 @@ impl LanguageServer for Backend {
         let workspace = self.workspace.read().await;
         let context = workspace.context_for(&position_params.text_document.uri);
         let items = match open.language {
-            DocumentLanguage::Sql => completion::completions(
-                &open.document,
-                position_params.position,
-                &context.schema,
-                context.kind,
-            ),
-            DocumentLanguage::Rust => embedded::completions(
-                &open.document,
-                position_params.position,
-                &context.schema,
-                context.kind,
-            ),
+            DocumentLanguage::Sql => {
+                let parsed = ParsedSql::parse(context.kind.dialect(), open.document.text());
+                completion::completions(
+                    &open.document,
+                    &parsed,
+                    position_params.position,
+                    &context.schema,
+                )
+            }
+            DocumentLanguage::Rust => {
+                let extracted = EmbeddedSql::extract(&open.document);
+                embedded::completions(
+                    &extracted,
+                    position_params.position,
+                    &context.schema,
+                    context.kind,
+                )
+            }
         };
         if items.is_empty() {
             return Ok(None);
@@ -292,18 +299,24 @@ impl LanguageServer for Backend {
         let workspace = self.workspace.read().await;
         let context = workspace.context_for(&position_params.text_document.uri);
         let location = match open.language {
-            DocumentLanguage::Sql => definition::definition(
-                &open.document,
-                position_params.position,
-                &context.schema,
-                context.kind,
-            ),
-            DocumentLanguage::Rust => embedded::definition(
-                &open.document,
-                position_params.position,
-                &context.schema,
-                context.kind,
-            ),
+            DocumentLanguage::Sql => {
+                let parsed = ParsedSql::parse(context.kind.dialect(), open.document.text());
+                definition::definition(
+                    &open.document,
+                    &parsed,
+                    position_params.position,
+                    &context.schema,
+                )
+            }
+            DocumentLanguage::Rust => {
+                let extracted = EmbeddedSql::extract(&open.document);
+                embedded::definition(
+                    &extracted,
+                    position_params.position,
+                    &context.schema,
+                    context.kind,
+                )
+            }
         };
         Ok(location.map(GotoDefinitionResponse::Scalar))
     }
@@ -316,18 +329,24 @@ impl LanguageServer for Backend {
         let workspace = self.workspace.read().await;
         let context = workspace.context_for(&position_params.text_document.uri);
         Ok(match open.language {
-            DocumentLanguage::Sql => hover::hover(
-                &open.document,
-                position_params.position,
-                &context.schema,
-                context.kind,
-            ),
-            DocumentLanguage::Rust => embedded::hover(
-                &open.document,
-                position_params.position,
-                &context.schema,
-                context.kind,
-            ),
+            DocumentLanguage::Sql => {
+                let parsed = ParsedSql::parse(context.kind.dialect(), open.document.text());
+                hover::hover(
+                    &open.document,
+                    &parsed,
+                    position_params.position,
+                    &context.schema,
+                )
+            }
+            DocumentLanguage::Rust => {
+                let extracted = EmbeddedSql::extract(&open.document);
+                embedded::hover(
+                    &extracted,
+                    position_params.position,
+                    &context.schema,
+                    context.kind,
+                )
+            }
         })
     }
 
@@ -345,8 +364,14 @@ impl LanguageServer for Backend {
             .context_for(&params.text_document.uri)
             .kind;
         let data = match open.language {
-            DocumentLanguage::Sql => semantic_tokens::semantic_tokens(&open.document, kind),
-            DocumentLanguage::Rust => embedded::embedded_semantic_tokens(&open.document, kind),
+            DocumentLanguage::Sql => {
+                let parsed = ParsedSql::parse(kind.dialect(), open.document.text());
+                semantic_tokens::semantic_tokens(&open.document, &parsed)
+            }
+            DocumentLanguage::Rust => {
+                let extracted = EmbeddedSql::extract(&open.document);
+                embedded::embedded_semantic_tokens(&extracted, kind)
+            }
         };
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,

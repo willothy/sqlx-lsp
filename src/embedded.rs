@@ -15,6 +15,7 @@ use tree_sitter::{Node, Parser};
 use crate::analysis::semantic_tokens;
 use crate::db::DatabaseKind;
 use crate::document::Document;
+use crate::parse::ParsedSql;
 use crate::schema::Schema;
 
 /// sqlx macros whose first string-literal argument is SQL. `query_file!`
@@ -254,37 +255,41 @@ fn string_literal_text(literal: Node<'_>, source: &str) -> Option<String> {
 /// Completion items for the SQL region at `position`, if the position is
 /// inside one.
 pub fn completions(
-    document: &Document,
+    embedded: &EmbeddedSql,
     position: Position,
     schema: &Schema,
     kind: DatabaseKind,
 ) -> Vec<CompletionItem> {
-    let embedded = EmbeddedSql::extract(document);
     let Some(region) = embedded.region_at(position) else {
         return Vec::new();
     };
     let sql_document = Document::new(region.text.clone());
+    let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
     crate::analysis::completion::completions(
         &sql_document,
+        &parsed,
         region.to_embedded(position),
         schema,
-        kind,
     )
 }
 
 /// Hover for the SQL region at `position`, with its highlight range mapped
 /// back to host-document coordinates.
 pub fn hover(
-    document: &Document,
+    embedded: &EmbeddedSql,
     position: Position,
     schema: &Schema,
     kind: DatabaseKind,
 ) -> Option<Hover> {
-    let embedded = EmbeddedSql::extract(document);
     let region = embedded.region_at(position)?;
     let sql_document = Document::new(region.text.clone());
-    let mut hover =
-        crate::analysis::hover::hover(&sql_document, region.to_embedded(position), schema, kind)?;
+    let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
+    let mut hover = crate::analysis::hover::hover(
+        &sql_document,
+        &parsed,
+        region.to_embedded(position),
+        schema,
+    )?;
     hover.range = hover.range.map(|range| region.to_host_range(range));
     Some(hover)
 }
@@ -292,31 +297,31 @@ pub fn hover(
 /// Goto definition for the SQL region at `position`. The result points into
 /// a migration file, so no coordinate mapping is needed.
 pub fn definition(
-    document: &Document,
+    embedded: &EmbeddedSql,
     position: Position,
     schema: &Schema,
     kind: DatabaseKind,
 ) -> Option<Location> {
-    let embedded = EmbeddedSql::extract(document);
     let region = embedded.region_at(position)?;
     let sql_document = Document::new(region.text.clone());
+    let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
     crate::analysis::definition::definition(
         &sql_document,
+        &parsed,
         region.to_embedded(position),
         schema,
-        kind,
     )
 }
 
 /// Semantic tokens for every SQL region in a Rust document, shifted to host
 /// coordinates and merged into one delta-encoded stream. The surrounding
 /// Rust code is untouched — its highlighting belongs to rust-analyzer.
-pub fn embedded_semantic_tokens(document: &Document, kind: DatabaseKind) -> Vec<SemanticToken> {
-    let embedded = EmbeddedSql::extract(document);
+pub fn embedded_semantic_tokens(embedded: &EmbeddedSql, kind: DatabaseKind) -> Vec<SemanticToken> {
     let mut all = Vec::new();
     for region in &embedded.regions {
         let sql_document = Document::new(region.text.clone());
-        for mut segment in semantic_tokens::segments(&sql_document, kind) {
+        let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
+        for mut segment in semantic_tokens::segments(&sql_document, &parsed) {
             if segment.line == 0 {
                 segment.start += region.range.start.character;
             }
@@ -490,8 +495,9 @@ async fn run(pool: &sqlx::PgPool) {
         let source = r#"fn f() { sqlx::query!("SELECT id FROM ").fetch_one(pool); }"#;
         let document = Document::new(source.to_owned());
         // Cursor right after `FROM `.
+        let extracted = EmbeddedSql::extract(&document);
         let labels: Vec<String> = completions(
-            &document,
+            &extracted,
             Position::new(0, 38),
             &schema(),
             DatabaseKind::Sqlite,
@@ -506,9 +512,10 @@ async fn run(pool: &sqlx::PgPool) {
     fn completion_outside_regions_offers_nothing() {
         let source = r#"fn f() { sqlx::query!("SELECT id FROM users"); }"#;
         let document = Document::new(source.to_owned());
+        let extracted = EmbeddedSql::extract(&document);
         assert!(
             completions(
-                &document,
+                &extracted,
                 Position::new(0, 3),
                 &schema(),
                 DatabaseKind::Sqlite
@@ -522,8 +529,9 @@ async fn run(pool: &sqlx::PgPool) {
         let source = r#"fn f() { sqlx::query!("SELECT id FROM users"); }"#;
         let document = Document::new(source.to_owned());
         // `users` occupies host characters 38..43.
+        let extracted = EmbeddedSql::extract(&document);
         let hover = hover(
-            &document,
+            &extracted,
             Position::new(0, 40),
             &schema(),
             DatabaseKind::Sqlite,
@@ -539,8 +547,9 @@ async fn run(pool: &sqlx::PgPool) {
         let source =
             "fn f() {\n    sqlx::query!(\n        r#\"SELECT id\nFROM users\"#,\n    );\n}";
         let document = Document::new(source.to_owned());
+        let extracted = EmbeddedSql::extract(&document);
         let hover = hover(
-            &document,
+            &extracted,
             Position::new(3, 7),
             &schema(),
             DatabaseKind::Sqlite,
@@ -556,7 +565,8 @@ async fn run(pool: &sqlx::PgPool) {
     fn semantic_tokens_are_shifted_into_the_host_document() {
         let source = r#"fn f() { sqlx::query!("SELECT id FROM users"); }"#;
         let document = Document::new(source.to_owned());
-        let tokens = embedded_semantic_tokens(&document, DatabaseKind::Sqlite);
+        let extracted = EmbeddedSql::extract(&document);
+        let tokens = embedded_semantic_tokens(&extracted, DatabaseKind::Sqlite);
         assert!(!tokens.is_empty());
         // First token is SELECT at the string content start (char 23).
         assert_eq!(tokens[0].delta_line, 0);
@@ -569,7 +579,8 @@ async fn run(pool: &sqlx::PgPool) {
         let source =
             "fn f() {\n    sqlx::query!(\"SELECT 1\");\n    sqlx::query!(\"SELECT 2\");\n}";
         let document = Document::new(source.to_owned());
-        let tokens = embedded_semantic_tokens(&document, DatabaseKind::Sqlite);
+        let extracted = EmbeddedSql::extract(&document);
+        let tokens = embedded_semantic_tokens(&extracted, DatabaseKind::Sqlite);
         // SELECT + number per region.
         assert_eq!(tokens.len(), 4);
         // Second region's first token is on the next line (delta encoded).
@@ -588,8 +599,9 @@ async fn run(pool: &sqlx::PgPool) {
 
         let source = r#"fn f() { sqlx::query!("SELECT id FROM users"); }"#;
         let document = Document::new(source.to_owned());
+        let extracted = EmbeddedSql::extract(&document);
         let location = definition(
-            &document,
+            &extracted,
             Position::new(0, 40),
             &schema,
             DatabaseKind::Sqlite,

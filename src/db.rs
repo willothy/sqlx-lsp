@@ -323,7 +323,7 @@ mod tests {
             detection
                 .sqlx_members
                 .iter()
-                .any(|member| member.root == PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+                .any(|member| member.root == Path::new(env!("CARGO_MANIFEST_DIR")))
         );
     }
 

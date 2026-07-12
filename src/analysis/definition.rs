@@ -3,8 +3,8 @@
 use tower_lsp::lsp_types::{Location, Position};
 
 use crate::analysis::resolve::{Resolved, resolve_at};
-use crate::db::DatabaseKind;
 use crate::document::Document;
+use crate::parse::ParsedSql;
 use crate::schema::Schema;
 
 /// The definition location of the schema object referenced at `position`.
@@ -14,11 +14,11 @@ use crate::schema::Schema;
 /// database introspection resolve to `None`.
 pub fn definition(
     document: &Document,
+    parsed: &ParsedSql,
     position: Position,
     schema: &Schema,
-    kind: DatabaseKind,
 ) -> Option<Location> {
-    let resolved = resolve_at(document, position, schema, kind)?;
+    let resolved = resolve_at(document, parsed, position, schema)?;
     let location = match resolved {
         Resolved::Table { table, .. } => table.location.clone(),
         Resolved::Column { table, column, .. } => {
@@ -31,6 +31,7 @@ pub fn definition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseKind;
     use crate::schema::{Table, TableKind, TableOrigin};
 
     fn migration_schema(dir: &tempfile::TempDir) -> Schema {
@@ -44,12 +45,8 @@ mod tests {
 
     fn definition_at(schema: &Schema, sql: &str, character: u32) -> Option<Location> {
         let document = Document::new(sql.to_owned());
-        definition(
-            &document,
-            Position::new(0, character),
-            schema,
-            DatabaseKind::Sqlite,
-        )
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        definition(&document, &parsed, Position::new(0, character), schema)
     }
 
     #[test]

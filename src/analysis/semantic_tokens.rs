@@ -20,7 +20,6 @@ use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Span, Token, Whitespace};
 use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegend};
 
-use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::parse::ParsedSql;
 
@@ -323,9 +322,7 @@ pub struct TokenSegment {
 /// Computes classified token segments for `document` at absolute positions.
 /// Callers that embed SQL in a host document can shift the positions before
 /// [`encode`]-ing; plain SQL documents use [`semantic_tokens`] directly.
-pub fn segments(document: &Document, kind: DatabaseKind) -> Vec<TokenSegment> {
-    let parsed = ParsedSql::parse(kind.dialect(), document.text());
-
+pub fn segments(document: &Document, parsed: &ParsedSql) -> Vec<TokenSegment> {
     let mut overlay = Overlay::default();
     for statement in &parsed.statements {
         let _ = statement.visit(&mut overlay);
@@ -400,13 +397,14 @@ pub fn encode(mut segments: Vec<TokenSegment>) -> Vec<SemanticToken> {
 
 /// Computes the full semantic token stream for `document`, delta-encoded as
 /// the LSP wire format requires.
-pub fn semantic_tokens(document: &Document, kind: DatabaseKind) -> Vec<SemanticToken> {
-    encode(segments(document, kind))
+pub fn semantic_tokens(document: &Document, parsed: &ParsedSql) -> Vec<SemanticToken> {
+    encode(segments(document, parsed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseKind;
 
     /// Decodes the delta encoding back to absolute
     /// (line, character, length, legend index) tuples.
@@ -428,7 +426,8 @@ mod tests {
 
     fn tokens_for(sql: &str) -> Vec<(u32, u32, u32, u32)> {
         let document = Document::new(sql.to_owned());
-        decode(&semantic_tokens(&document, DatabaseKind::Sqlite))
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        decode(&semantic_tokens(&document, &parsed))
     }
 
     #[test]

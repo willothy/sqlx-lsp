@@ -14,7 +14,6 @@ use sqlparser::ast::{
 use sqlparser::tokenizer::Span;
 use tower_lsp::lsp_types::{Position, Range};
 
-use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::parse::{ObjectNameExt, ParsedSql};
 use crate::schema::{Column, Schema, Table};
@@ -230,11 +229,10 @@ impl Visitor for References {
 /// Resolves the identifier at `position` in `document` to a schema object.
 pub fn resolve_at<'a>(
     document: &Document,
+    parsed: &ParsedSql,
     position: Position,
     schema: &'a Schema,
-    kind: DatabaseKind,
 ) -> Option<Resolved<'a>> {
-    let parsed = ParsedSql::parse(kind.dialect(), document.text());
     let references = References::collect(&parsed.statements);
 
     let candidate = references
@@ -290,6 +288,7 @@ pub fn resolve_at<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseKind;
 
     fn schema() -> Schema {
         let mut schema = Schema::default();
@@ -305,16 +304,13 @@ mod tests {
     fn resolve(sql: &str, line: u32, character: u32) -> Option<String> {
         let document = Document::new(sql.to_owned());
         let schema = schema();
-        resolve_at(
-            &document,
-            Position::new(line, character),
-            &schema,
-            DatabaseKind::Sqlite,
-        )
-        .map(|resolved| match resolved {
-            Resolved::Table { table, .. } => format!("table:{}", table.name),
-            Resolved::Column { table, column, .. } => {
-                format!("column:{}.{}", table.name, column.name)
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        resolve_at(&document, &parsed, Position::new(line, character), &schema).map(|resolved| {
+            match resolved {
+                Resolved::Table { table, .. } => format!("table:{}", table.name),
+                Resolved::Column { table, column, .. } => {
+                    format!("column:{}.{}", table.name, column.name)
+                }
             }
         })
     }

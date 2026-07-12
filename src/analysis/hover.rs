@@ -3,18 +3,18 @@
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::analysis::resolve::{Resolved, resolve_at};
-use crate::db::DatabaseKind;
 use crate::document::Document;
+use crate::parse::ParsedSql;
 use crate::schema::{Column, Schema, SourceLocation, Table, TableOrigin};
 
 /// Builds hover content for the schema object referenced at `position`.
 pub fn hover(
     document: &Document,
+    parsed: &ParsedSql,
     position: Position,
     schema: &Schema,
-    kind: DatabaseKind,
 ) -> Option<Hover> {
-    let resolved = resolve_at(document, position, schema, kind)?;
+    let resolved = resolve_at(document, parsed, position, schema)?;
     let (value, range) = match resolved {
         Resolved::Table { table, range } => (table_markdown(table), range),
         Resolved::Column {
@@ -68,6 +68,7 @@ fn column_markdown(table: &Table, column: &Column) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseKind;
 
     fn hover_value(sql: &str, character: u32) -> Option<String> {
         let mut schema = Schema::default();
@@ -77,12 +78,8 @@ mod tests {
             None,
         );
         let document = Document::new(sql.to_owned());
-        let hover = hover(
-            &document,
-            Position::new(0, character),
-            &schema,
-            DatabaseKind::Sqlite,
-        )?;
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        let hover = hover(&document, &parsed, Position::new(0, character), &schema)?;
         match hover.contents {
             HoverContents::Markup(markup) => Some(markup.value),
             _ => None,

@@ -13,7 +13,6 @@ use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, Position, Range,
 };
 
-use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::parse::ParsedSql;
 use crate::schema::{Column, Schema, Table, TableKind};
@@ -295,12 +294,11 @@ fn keyword_items(items: &mut Vec<CompletionItem>) {
 /// Computes completion items for `position` in `document`.
 pub fn completions(
     document: &Document,
+    parsed: &ParsedSql,
     position: Position,
     schema: &Schema,
-    kind: DatabaseKind,
 ) -> Vec<CompletionItem> {
-    let parsed = ParsedSql::parse(kind.dialect(), document.text());
-    let cursor = Cursor::locate(&parsed, document, position);
+    let cursor = Cursor::locate(parsed, document, position);
     let scope = cursor.scope();
     let resolve_table = |name: &str| {
         let lowered = name.to_ascii_lowercase();
@@ -349,6 +347,7 @@ pub fn completions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseKind;
 
     fn schema() -> Schema {
         let mut schema = Schema::default();
@@ -375,11 +374,12 @@ mod tests {
             .encode_utf16()
             .count() as u32;
         let document = Document::new(text);
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
         completions(
             &document,
+            &parsed,
             Position::new(line, character),
             &schema(),
-            DatabaseKind::Sqlite,
         )
         .into_iter()
         .map(|item| item.label)
