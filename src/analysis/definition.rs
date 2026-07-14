@@ -1,6 +1,6 @@
 //! Goto definition for schema objects referenced in SQL documents.
 
-use tower_lsp::lsp_types::{Location, Position};
+use tower_lsp_server::ls_types::{Location, Position};
 
 use crate::analysis::resolve::{Resolved, resolve_at};
 use crate::document::Document;
@@ -54,7 +54,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let schema = migration_schema(&dir);
         let location = definition_at(&schema, "SELECT id FROM users", 17).expect("has definition");
-        assert!(location.uri.path().ends_with("1_init.sql"));
+        assert!(location.uri.path().as_str().ends_with("1_init.sql"));
         assert_eq!(location.range.start.line, 0);
         assert_eq!(location.range.start.character, 13);
     }
@@ -65,7 +65,7 @@ mod tests {
         let schema = migration_schema(&dir);
         let location =
             definition_at(&schema, "SELECT email FROM users", 8).expect("has definition");
-        assert!(location.uri.path().ends_with("1_init.sql"));
+        assert!(location.uri.path().as_str().ends_with("1_init.sql"));
         assert_eq!(location.range.start.line, 2);
         assert_eq!(location.range.start.character, 2);
     }

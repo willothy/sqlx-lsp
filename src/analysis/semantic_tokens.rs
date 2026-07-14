@@ -18,7 +18,7 @@ use sqlparser::ast::{
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Span, Token, Whitespace};
-use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegend};
+use tower_lsp_server::ls_types::{SemanticToken, SemanticTokenType, SemanticTokensLegend};
 
 use crate::document::Document;
 use crate::parse::ParsedSql;

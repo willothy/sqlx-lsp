@@ -7,7 +7,7 @@
 //! between all three.
 
 use sqlparser::tokenizer::{Location as SqlLocation, Span as SqlSpan};
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp_server::ls_types::{Position, Range};
 
 /// The text of one open document.
 #[derive(Debug, Clone)]

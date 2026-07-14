@@ -1,7 +1,7 @@
 //! Entry point: serves the sqlx language server over stdio.
 
 use sqlx_lsp::server::Backend;
-use tower_lsp::{LspService, Server};
+use tower_lsp_server::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

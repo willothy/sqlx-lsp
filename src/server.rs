@@ -2,7 +2,7 @@
 
 use dashmap::DashMap;
 use tokio::sync::RwLock;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
@@ -12,9 +12,9 @@ use tower_lsp::lsp_types::{
     SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Unregistration,
-    Url, WorkDoneProgressOptions,
+    Uri, WorkDoneProgressOptions,
 };
-use tower_lsp::{Client, LanguageServer, jsonrpc};
+use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,10 +37,10 @@ enum DocumentLanguage {
 impl DocumentLanguage {
     /// Chooses by the client-reported language id, falling back to the file
     /// extension when the id is unavailable (e.g. changes to unopened docs).
-    fn detect(language_id: Option<&str>, uri: &Url) -> DocumentLanguage {
+    fn detect(language_id: Option<&str>, uri: &Uri) -> DocumentLanguage {
         let is_rust = match language_id {
             Some(id) => id == "rust",
-            None => uri.path().ends_with(".rs"),
+            None => uri.path().as_str().ends_with(".rs"),
         };
         if is_rust {
             DocumentLanguage::Rust
@@ -114,7 +114,7 @@ impl OpenDocument {
 /// The tower-lsp backend serving SQL language features.
 pub struct Backend {
     client: Client,
-    documents: DashMap<Url, OpenDocument>,
+    documents: DashMap<Uri, OpenDocument>,
     workspace: RwLock<Workspace>,
     /// Set once the client rejects dynamic watcher registration, so reloads
     /// stop retrying (the did_save fallback covers those clients).
@@ -208,8 +208,8 @@ impl Backend {
 
     /// Whether a changed file affects workspace state (migrations, manifest,
     /// configuration, or environment) rather than just an open document.
-    async fn affects_workspace(&self, uri: &Url) -> bool {
-        let Ok(path) = uri.to_file_path() else {
+    async fn affects_workspace(&self, uri: &Uri) -> bool {
+        let Some(path) = uri.to_file_path() else {
             return false;
         };
         let file_name = path.file_name().and_then(|name| name.to_str());
@@ -240,16 +240,18 @@ impl Backend {
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        // `root_uri` is deprecated in the protocol but still the only root
+        // older clients send; keep it as the fallback.
+        #[allow(deprecated)]
         let root = params
             .workspace_folders
             .as_ref()
             .and_then(|folders| folders.first())
             .map(|folder| folder.uri.clone())
             .or(params.root_uri)
-            .and_then(|uri| uri.to_file_path().ok());
+            .and_then(|uri| uri.to_file_path().map(|path| path.into_owned()));
         self.workspace.write().await.root = root;
 
         Ok(InitializeResult {
@@ -284,6 +286,7 @@ impl LanguageServer for Backend {
                 name: env!("CARGO_PKG_NAME").to_owned(),
                 version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             }),
+            ..InitializeResult::default()
         })
     }
 

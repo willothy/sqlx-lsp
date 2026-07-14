@@ -13,7 +13,7 @@ use sqlparser::ast::{
     Visitor,
 };
 use sqlparser::tokenizer::Span;
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp_server::ls_types::{Position, Range};
 
 use crate::document::Document;
 use crate::parse::{ObjectNameExt, ParsedSql};

@@ -15,7 +15,7 @@ use sqlparser::ast::{
     SetExpr, Statement, TableConstraint, TableFactor,
 };
 use sqlparser::tokenizer::Span as SqlSpan;
-use tower_lsp::lsp_types::{Location, Range, Url};
+use tower_lsp_server::ls_types::{Location, Range, Uri};
 
 use crate::db::DatabaseKind;
 use crate::document::Document;
@@ -25,7 +25,7 @@ use crate::parse::{ObjectNameExt, ParsedSql};
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceLocation {
     /// URI of the defining file.
-    pub uri: Url,
+    pub uri: Uri,
     /// Range of the defining identifier within that file.
     pub range: Range,
 }
@@ -278,7 +278,7 @@ impl Schema {
                     path: file.path.clone(),
                     source,
                 })?;
-            let uri = Url::from_file_path(&absolute).map_err(|()| SchemaError::InvalidPath {
+            let uri = Uri::from_file_path(&absolute).ok_or_else(|| SchemaError::InvalidPath {
                 path: file.path.clone(),
             })?;
             self.apply_sql(&text, kind, Some(&uri));
@@ -289,7 +289,7 @@ impl Schema {
     /// Applies every DDL statement in `sql` to the index. Statements that
     /// fail to parse are skipped; non-DDL statements are ignored. When `uri`
     /// is provided, definitions are recorded with source locations.
-    pub fn apply_sql(&mut self, sql: &str, kind: DatabaseKind, uri: Option<&Url>) {
+    pub fn apply_sql(&mut self, sql: &str, kind: DatabaseKind, uri: Option<&Uri>) {
         let parsed = ParsedSql::parse(kind.dialect(), sql);
         let document = Document::new(sql.to_owned());
         for statement in &parsed.statements {
@@ -297,7 +297,7 @@ impl Schema {
         }
     }
 
-    fn apply_statement(&mut self, statement: &Statement, uri: Option<&Url>, document: &Document) {
+    fn apply_statement(&mut self, statement: &Statement, uri: Option<&Uri>, document: &Document) {
         match statement {
             Statement::CreateTable(create) => self.apply_create_table(create, uri, document),
             Statement::CreateView(create) => self.apply_create_view(create, uri, document),
@@ -318,7 +318,7 @@ impl Schema {
     }
 
     fn source_location(
-        uri: Option<&Url>,
+        uri: Option<&Uri>,
         document: &Document,
         span: SqlSpan,
     ) -> Option<SourceLocation> {
@@ -330,7 +330,7 @@ impl Schema {
         })
     }
 
-    fn column_from_def(def: &ColumnDef, uri: Option<&Url>, document: &Document) -> Column {
+    fn column_from_def(def: &ColumnDef, uri: Option<&Uri>, document: &Document) -> Column {
         let mut not_null = false;
         let mut primary_key = false;
         let mut default = None;
@@ -359,7 +359,7 @@ impl Schema {
         }
     }
 
-    fn apply_create_table(&mut self, create: &CreateTable, uri: Option<&Url>, document: &Document) {
+    fn apply_create_table(&mut self, create: &CreateTable, uri: Option<&Uri>, document: &Document) {
         let Some(ident) = create.name.simple_ident() else {
             return;
         };
@@ -401,7 +401,7 @@ impl Schema {
         });
     }
 
-    fn apply_create_view(&mut self, create: &CreateView, uri: Option<&Url>, document: &Document) {
+    fn apply_create_view(&mut self, create: &CreateView, uri: Option<&Uri>, document: &Document) {
         let Some(ident) = create.name.simple_ident() else {
             return;
         };
@@ -435,7 +435,7 @@ impl Schema {
         });
     }
 
-    fn apply_alter_table(&mut self, alter: &AlterTable, uri: Option<&Url>, document: &Document) {
+    fn apply_alter_table(&mut self, alter: &AlterTable, uri: Option<&Uri>, document: &Document) {
         let Some(ident) = alter.name.simple_ident() else {
             return;
         };
@@ -736,7 +736,7 @@ mod tests {
         let users = schema.table("users").expect("exists");
 
         let table_location = users.location.as_ref().expect("has location");
-        assert!(table_location.uri.path().ends_with("1_init.sql"));
+        assert!(table_location.uri.path().as_str().ends_with("1_init.sql"));
         assert_eq!(table_location.range.start.line, 0);
         assert_eq!(table_location.range.start.character, 13);
 

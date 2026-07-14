@@ -9,7 +9,7 @@
 //! losslessly, while a rare `\n` escape inside a plain string is simply seen
 //! by the SQL parser as a backslash and an `n`.
 
-use tower_lsp::lsp_types::{CompletionItem, Hover, Location, Position, Range, SemanticToken};
+use tower_lsp_server::ls_types::{CompletionItem, Hover, Location, Position, Range, SemanticToken};
 use tree_sitter::{Node, Parser};
 
 use crate::analysis::semantic_tokens;
@@ -608,6 +608,6 @@ async fn run(pool: &sqlx::PgPool) {
             DatabaseKind::Sqlite,
         )
         .expect("has definition");
-        assert!(location.uri.path().ends_with("1_init.sql"));
+        assert!(location.uri.path().as_str().ends_with("1_init.sql"));
     }
 }

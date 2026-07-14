@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::Token;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, Position, Range,
 };
 

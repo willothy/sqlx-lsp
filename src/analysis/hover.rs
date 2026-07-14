@@ -1,6 +1,6 @@
 //! Hover information for schema objects referenced in SQL documents.
 
-use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
+use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::analysis::resolve::{Resolved, resolve_at};
 use crate::document::Document;
@@ -37,10 +37,12 @@ fn origin_line(origin: TableOrigin, location: Option<&SourceLocation>) -> String
         (TableOrigin::Migration, Some(location)) => {
             let file = location
                 .uri
-                .path_segments()
-                .and_then(|mut segments| segments.next_back())
-                .unwrap_or("migration")
-                .to_owned();
+                .to_file_path()
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "migration".to_owned());
             format!("*defined in {file}*")
         }
         (TableOrigin::Migration, None) => "*defined in migrations*".to_owned(),

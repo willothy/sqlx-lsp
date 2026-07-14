@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use tower_lsp::lsp_types::{MessageType, Url};
+use tower_lsp_server::ls_types::{MessageType, Uri};
 
 use crate::config::SqlxConfig;
 use crate::db::{DatabaseKind, Detection, SqlxMember};
@@ -75,14 +75,14 @@ impl Default for Workspace {
 impl Workspace {
     /// The context serving `uri`: the deepest context crate containing the
     /// file, or the fallback.
-    pub fn context_for(&self, uri: &Url) -> &DbContext {
-        let Ok(path) = uri.to_file_path() else {
+    pub fn context_for(&self, uri: &Uri) -> &DbContext {
+        let Some(path) = uri.to_file_path() else {
             return &self.fallback;
         };
         // Context roots come from `cargo metadata` canonicalized; editor
         // URIs may spell the same file through symlinks (`/var` vs
         // `/private/var` on macOS).
-        let path = normalize(path);
+        let path = normalize(path.into_owned());
         self.contexts
             .iter()
             .filter(|context| path.starts_with(&context.root))
@@ -510,7 +510,7 @@ mod tests {
             fallback: context(Path::new("/repo"), DatabaseKind::Sqlite),
             migration_dirs: Vec::new(),
         };
-        let uri = |path: &str| Url::from_file_path(path).expect("valid path");
+        let uri = |path: &str| Uri::from_file_path(path).expect("valid path");
 
         let api = workspace.context_for(&uri("/repo/services/api/queries/get.sql"));
         assert_eq!(api.kind, DatabaseKind::Postgres);
@@ -656,7 +656,7 @@ mod tests {
 
         assert_eq!(workspace.contexts.len(), 2, "{}", dump());
 
-        let uri = |path: PathBuf| Url::from_file_path(path).expect("valid path");
+        let uri = |path: PathBuf| Uri::from_file_path(path).expect("valid path");
         let pg_context = workspace.context_for(&uri(pg.join("src").join("main.rs")));
         assert_eq!(pg_context.kind, DatabaseKind::Postgres, "{}", dump());
         assert!(pg_context.schema.table("users").is_some(), "{}", dump());
