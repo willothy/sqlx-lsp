@@ -638,6 +638,46 @@ fn references_span_open_documents_and_migrations() {
 }
 
 #[test]
+fn workspace_symbols_search_the_schema_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_init.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);\n\
+         CREATE TABLE posts (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let symbols = |client: &mut LspClient, query: &str| {
+        client
+            .request("workspace/symbol", json!({ "query": query }))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // A substring query finds the table, located in its migration.
+    let found = symbols(&mut client, "user");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["name"], "users");
+    assert!(
+        found[0]["location"]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("1_init.sql")),
+        "{found:?}"
+    );
+
+    // Columns match too, naming their table as the container.
+    let found = symbols(&mut client, "email");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["containerName"], "users");
+
+    // An empty query returns the whole index: 2 tables and 3 columns.
+    assert_eq!(symbols(&mut client, "").len(), 5);
+}
+
+#[test]
 fn document_highlight_marks_occurrences_in_the_requesting_document() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");

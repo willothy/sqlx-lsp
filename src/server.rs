@@ -17,10 +17,11 @@ use tower_lsp_server::ls_types::{
     SemanticTokensDelta, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, Unregistration, Uri, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Unregistration, Uri,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
@@ -728,6 +729,7 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -914,6 +916,90 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         Ok(Some(locations))
+    }
+
+    // `SymbolInformation` carries a deprecated-but-mandatory field.
+    #[allow(deprecated)]
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> jsonrpc::Result<Option<WorkspaceSymbolResponse>> {
+        let query = params.query.to_ascii_lowercase();
+        let matches = |name: &str| query.is_empty() || name.to_ascii_lowercase().contains(&query);
+
+        let workspace = self.workspace.read().await;
+        // Folder contexts merge their members' tables (same locations), so
+        // symbols dedup by identity.
+        let mut seen = HashSet::new();
+        let mut symbols = Vec::new();
+        let contexts = workspace
+            .contexts
+            .iter()
+            .chain(workspace.folder_contexts.iter());
+        for context in contexts {
+            for table in context.schema.tables() {
+                if let Some(location) = &table.location
+                    && matches(&table.name)
+                    && seen.insert((
+                        table.name.clone(),
+                        None::<String>,
+                        location.uri.as_str().to_owned(),
+                        location.range.start.line,
+                        location.range.start.character,
+                    ))
+                {
+                    symbols.push(SymbolInformation {
+                        name: table.name.clone(),
+                        kind: match table.kind {
+                            crate::schema::TableKind::Table => SymbolKind::CLASS,
+                            crate::schema::TableKind::View => SymbolKind::INTERFACE,
+                        },
+                        tags: None,
+                        deprecated: None,
+                        location: location.clone().into(),
+                        container_name: None,
+                    });
+                }
+                for column in &table.columns {
+                    if let Some(location) = &column.location
+                        && matches(&column.name)
+                        && seen.insert((
+                            column.name.clone(),
+                            Some(table.name.clone()),
+                            location.uri.as_str().to_owned(),
+                            location.range.start.line,
+                            location.range.start.character,
+                        ))
+                    {
+                        symbols.push(SymbolInformation {
+                            name: column.name.clone(),
+                            kind: SymbolKind::FIELD,
+                            tags: None,
+                            deprecated: None,
+                            location: location.clone().into(),
+                            container_name: Some(table.name.clone()),
+                        });
+                    }
+                }
+            }
+        }
+
+        if symbols.is_empty() {
+            return Ok(None);
+        }
+        symbols.sort_by(|a, b| {
+            (
+                &a.name,
+                a.location.uri.as_str(),
+                a.location.range.start.line,
+            )
+                .cmp(&(
+                    &b.name,
+                    b.location.uri.as_str(),
+                    b.location.range.start.line,
+                ))
+        });
+        Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
     }
 
     async fn document_highlight(
