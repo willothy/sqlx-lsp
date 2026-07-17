@@ -217,6 +217,74 @@ impl<'s> References<'s> {
     }
 }
 
+/// A candidate resolved to the schema or query-local object it names.
+enum CandidateResolution<'a> {
+    /// The candidate names a relation (directly or through an alias).
+    Table { table: &'a Table },
+    /// The candidate names a column of a relation.
+    Column {
+        table: &'a Table,
+        column: &'a Column,
+    },
+}
+
+impl References<'_> {
+    /// Resolves `candidate` through its statement's name scope.
+    ///
+    /// An alias or relation name resolves through the statement's own
+    /// relations first, then its scope, then a direct schema lookup.
+    /// Unqualified columns prefer relations referenced by the enclosing
+    /// statement and fall back to any relation with a matching column.
+    fn resolve_candidate(&self, candidate: &Candidate) -> Option<CandidateResolution<'_>> {
+        let scope = &self.scopes[candidate.statement];
+        let locals = &self.locals[candidate.statement];
+        let table_via_scope = |name: &str| {
+            locals
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(name))
+                .or_else(|| {
+                    let lowered = name.to_ascii_lowercase();
+                    scope
+                        .get(&lowered)
+                        .and_then(|target| self.schema.table(target))
+                        .or_else(|| self.schema.table(name))
+                })
+        };
+
+        match &candidate.kind {
+            CandidateKind::Table { name } => {
+                let table = table_via_scope(name)?;
+                Some(CandidateResolution::Table { table })
+            }
+            CandidateKind::Column { qualifier, name } => {
+                let table = match qualifier {
+                    Some(qualifier) => {
+                        let table = table_via_scope(qualifier)?;
+                        table.column(name)?;
+                        table
+                    }
+                    None => locals
+                        .iter()
+                        .find(|table| table.column(name).is_some())
+                        .or_else(|| {
+                            scope
+                                .values()
+                                .filter_map(|target| self.schema.table(target))
+                                .find(|table| table.column(name).is_some())
+                        })
+                        .or_else(|| {
+                            self.schema
+                                .tables()
+                                .find(|table| table.column(name).is_some())
+                        })?,
+                };
+                let column = table.column(name)?;
+                Some(CandidateResolution::Column { table, column })
+            }
+        }
+    }
+}
+
 impl Visitor for References<'_> {
     type Break = ();
 
@@ -416,62 +484,18 @@ pub fn resolve_at(
         .candidates
         .iter()
         .find(|candidate| document.position_in_span(position, candidate.span))?;
-    let scope = &references.scopes[candidate.statement];
-    let locals = &references.locals[candidate.statement];
     let range = document.range_of(candidate.span)?;
 
-    // An alias or relation name resolves through the statement's own
-    // relations first, then its scope, then a direct schema lookup.
-    let table_via_scope = |name: &str| {
-        locals
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(name))
-            .or_else(|| {
-                let lowered = name.to_ascii_lowercase();
-                scope
-                    .get(&lowered)
-                    .and_then(|target| schema.table(target))
-                    .or_else(|| schema.table(name))
-            })
-    };
-
-    match &candidate.kind {
-        CandidateKind::Table { name } => {
-            let table = table_via_scope(name)?;
-            Some(Resolved::Table {
-                table: table.clone(),
-                range,
-            })
-        }
-        CandidateKind::Column { qualifier, name } => {
-            let table = match qualifier {
-                Some(qualifier) => {
-                    let table = table_via_scope(qualifier)?;
-                    table.column(name)?;
-                    table
-                }
-                None => {
-                    // Prefer relations referenced by the enclosing statement;
-                    // fall back to any relation with a matching column.
-                    locals
-                        .iter()
-                        .find(|table| table.column(name).is_some())
-                        .or_else(|| {
-                            scope
-                                .values()
-                                .filter_map(|target| schema.table(target))
-                                .find(|table| table.column(name).is_some())
-                        })
-                        .or_else(|| schema.tables().find(|table| table.column(name).is_some()))?
-                }
-            };
-            let column = table.column(name)?.clone();
-            Some(Resolved::Column {
-                table: table.clone(),
-                column,
-                range,
-            })
-        }
+    match references.resolve_candidate(candidate)? {
+        CandidateResolution::Table { table } => Some(Resolved::Table {
+            table: table.clone(),
+            range,
+        }),
+        CandidateResolution::Column { table, column } => Some(Resolved::Column {
+            table: table.clone(),
+            column: column.clone(),
+            range,
+        }),
     }
 }
 
