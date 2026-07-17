@@ -548,6 +548,39 @@ fn rust_buffers_serve_sql_inside_query_macros() {
 }
 
 #[test]
+fn bind_parameter_mismatches_are_flagged_in_rust_buffers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let main_uri = file_uri(&dir.path().join("src").join("main.rs"));
+    let source =
+        "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users WHERE id = ?\");\n}\n";
+    client.open_as(&main_uri, "rust", source);
+    let diagnostics = client.wait_for_diagnostics(&main_uri);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0]["severity"], 1, "{diagnostics:?}");
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("1 bind parameter but 0 arguments")),
+        "{diagnostics:?}"
+    );
+
+    // Supplying the argument clears the diagnostic.
+    let source =
+        "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users WHERE id = ?\", id);\n}\n";
+    client.change(&main_uri, 2, source);
+    let diagnostics = client.wait_for_diagnostics(&main_uri);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
 fn references_span_open_documents_and_migrations() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");

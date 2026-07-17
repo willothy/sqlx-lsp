@@ -10,7 +10,8 @@
 //! by the SQL parser as a backslash and an `n`.
 
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionTextEdit, Diagnostic, Hover, Location, Position, Range, SemanticToken,
+    CompletionItem, CompletionTextEdit, Diagnostic, DiagnosticSeverity, Hover, Location, Position,
+    Range, SemanticToken,
 };
 use tree_sitter::{Node, Parser};
 
@@ -40,6 +41,9 @@ pub struct SqlRegion {
     pub text: String,
     /// Where that text sits in the host document.
     pub range: Range,
+    /// How many macro arguments follow the SQL string — the values sqlx
+    /// binds to the query's placeholders.
+    pub arguments: usize,
 }
 
 impl SqlRegion {
@@ -224,7 +228,39 @@ impl EmbeddedSql {
                 start: document.position_at(start),
                 end: document.position_at(end),
             },
+            arguments: Self::arguments_after(token_tree, literal),
         })
+    }
+
+    /// The number of top-level comma-separated argument groups following
+    /// `literal` in the macro's token tree — the bind values of a query
+    /// macro. Commas inside nested token trees belong to inner calls, and a
+    /// trailing comma opens no new argument.
+    fn arguments_after(token_tree: Node<'_>, literal: Node<'_>) -> usize {
+        let mut cursor = token_tree.walk();
+        let mut arguments = 0;
+        let mut past_literal = false;
+        let mut segment_nonempty = false;
+        for child in token_tree.children(&mut cursor) {
+            if !past_literal {
+                past_literal = child.id() == literal.id();
+                continue;
+            }
+            match child.kind() {
+                "," => {
+                    if segment_nonempty {
+                        arguments += 1;
+                        segment_nonempty = false;
+                    }
+                }
+                ")" | "]" | "}" => break,
+                _ => segment_nonempty = true,
+            }
+        }
+        if segment_nonempty {
+            arguments += 1;
+        }
+        arguments
     }
 }
 
@@ -358,7 +394,8 @@ pub fn definition(
 }
 
 /// Diagnostics for every SQL region of a Rust document, mapped to host
-/// coordinates.
+/// coordinates: the SQL analyses plus a bind-parameter arity check against
+/// the macro's arguments.
 pub fn diagnostics(embedded: &EmbeddedSql, schema: &Schema, kind: DatabaseKind) -> Vec<Diagnostic> {
     let mut all = Vec::new();
     for region in &embedded.regions {
@@ -369,6 +406,25 @@ pub fn diagnostics(embedded: &EmbeddedSql, schema: &Schema, kind: DatabaseKind) 
         {
             diagnostic.range = region.to_host_range(diagnostic.range);
             all.push(diagnostic);
+        }
+        if let Some(required) = parsed.required_bind_parameters()
+            && required != region.arguments
+        {
+            let parameters = match required {
+                1 => "1 bind parameter".to_owned(),
+                _ => format!("{required} bind parameters"),
+            };
+            let arguments = match region.arguments {
+                1 => "1 argument is".to_owned(),
+                _ => format!("{} arguments are", region.arguments),
+            };
+            all.push(Diagnostic {
+                range: region.range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("sqlx-lsp".to_owned()),
+                message: format!("query expects {parameters} but {arguments} provided"),
+                ..Diagnostic::default()
+            });
         }
     }
     all
@@ -518,6 +574,51 @@ mod tests {
         );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].text, "SELECT id FROM users WHERE id = ?");
+    }
+
+    #[test]
+    fn counts_macro_arguments_after_the_sql_string() {
+        let arguments = |source: &str| extract(source)[0].arguments;
+
+        assert_eq!(arguments(r#"fn f() { sqlx::query!("SELECT 1"); }"#), 0);
+        assert_eq!(arguments(r#"fn f() { sqlx::query!("SELECT ?", a); }"#), 1);
+        // Nested calls keep their commas to themselves; a trailing comma
+        // opens no new argument.
+        assert_eq!(
+            arguments(r#"fn f() { sqlx::query!("SELECT ?, ?", f(a, b), c,); }"#),
+            2
+        );
+        // query_as! arguments count from after the SQL string, not the type.
+        assert_eq!(
+            arguments(r#"fn f() { sqlx::query_as!(User, "SELECT ?", id); }"#),
+            1
+        );
+    }
+
+    #[test]
+    fn bind_parameter_arity_mismatches_are_diagnosed() {
+        let diagnostics_for = |source: &str| {
+            let embedded = EmbeddedSql::extract(&Document::new(source.to_owned()));
+            diagnostics(
+                &embedded,
+                &Schema::default(),
+                crate::db::DatabaseKind::Sqlite,
+            )
+        };
+
+        let all = diagnostics_for(r#"fn f() { sqlx::query!("SELECT ?, ?", a); }"#);
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(all[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            all[0]
+                .message
+                .contains("2 bind parameters but 1 argument is provided"),
+            "{}",
+            all[0].message
+        );
+
+        assert!(diagnostics_for(r#"fn f() { sqlx::query!("SELECT ?, ?", a, b); }"#).is_empty());
+        assert!(diagnostics_for(r#"fn f() { sqlx::query!("SELECT 1"); }"#).is_empty());
     }
 
     #[test]

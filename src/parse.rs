@@ -81,6 +81,35 @@ impl ParsedSql {
             issues,
         }
     }
+
+    /// The number of bind arguments the SQL expects, from its placeholder
+    /// tokens: a bare `?` takes the next position, `?N` and `$N` select
+    /// position N, and the requirement is the highest position used —
+    /// SQLite's numbering rules, which subsume the postgres (`$N` only) and
+    /// mysql (`?` only) forms. `None` when a named placeholder appears; the
+    /// argument mapping is not positional then.
+    pub fn required_bind_parameters(&self) -> Option<usize> {
+        let mut position = 0usize;
+        let mut required = 0usize;
+        for token in &self.tokens {
+            let Token::Placeholder(text) = &token.token else {
+                continue;
+            };
+            if text == "?" {
+                position += 1;
+            } else if let Some(index) = text
+                .strip_prefix('?')
+                .or_else(|| text.strip_prefix('$'))
+                .and_then(|rest| rest.parse::<usize>().ok())
+            {
+                position = index;
+            } else {
+                return None;
+            }
+            required = required.max(position);
+        }
+        Some(required)
+    }
 }
 
 /// Strips sqlparser's trailing ` at Line: N, Column: M` from an error
@@ -120,6 +149,24 @@ impl ObjectNameExt for ObjectName {
 mod tests {
     use super::*;
     use sqlparser::dialect::SQLiteDialect;
+
+    #[test]
+    fn bind_parameter_counts_follow_placeholder_positions() {
+        let count = |sql: &str| ParsedSql::parse(&SQLiteDialect {}, sql).required_bind_parameters();
+
+        assert_eq!(count("SELECT * FROM users"), Some(0));
+        assert_eq!(count("SELECT * FROM users WHERE id = ?"), Some(1));
+        assert_eq!(count("SELECT ? , ? , ?"), Some(3));
+        // Numbered placeholders select their position; repeats don't add.
+        assert_eq!(count("SELECT $1, $2, $1"), Some(2));
+        assert_eq!(count("SELECT ?2"), Some(2));
+        // A bare `?` continues from the last selected position.
+        assert_eq!(count("SELECT ?3, ?"), Some(4));
+        // Placeholders inside string literals are literals.
+        assert_eq!(count("SELECT '?' FROM users"), Some(0));
+        // Named placeholders make the mapping non-positional.
+        assert_eq!(count("SELECT $name"), None);
+    }
 
     #[test]
     fn recovers_after_a_broken_statement() {
