@@ -10,66 +10,62 @@ index from your migrations, and serves editor features against that schema.
 
 ## Features
 
-- **Database detection** — reads the resolved features of the `sqlx` package
-  via `cargo metadata`. `sqlite`, `postgres`, and `mysql` select the matching
-  SQL dialect for parsing; when several are enabled the server prefers
-  `postgres` > `mysql` > `sqlite` and logs the ambiguity.
-- **Per-crate database contexts** — the server mirrors how the sqlx macros
-  resolve everything relative to the invoking crate. Each workspace member
-  that depends on sqlx gets its own context: its `sqlx.toml`
-  (`database-url-var`, `migrations-dir`), its environment (the crate's URL
-  variable from the process environment or ancestor `.env` files, parsed
-  with dotenvy exactly like sqlx), its backend (the URL scheme decides,
-  gated on the enabled driver features — `postgres`/`postgresql`,
-  `mysql`/`mariadb`, `sqlite` — with declared features as the fallback),
-  and its migrations (every `sqlx::migrate!()` target found in its sources,
-  defaulting to the configured migrations directory). A workspace mixing a
-  postgres crate and a sqlite crate serves each crate's SQL against the
-  right schema and dialect. Documents outside any sqlx crate get a
-  workspace-wide context that merges everything. `SQLX_OFFLINE=true`
-  disables live introspection for a context, matching the macros' contract.
-  Multi-root workspaces are fully supported: every workspace folder gets its
-  own contexts, and folders added or removed mid-session
-  (`workspace/didChangeWorkspaceFolders`) rebuild the index immediately.
-- **Schema index** — replays the `.sql` migrations a crate consumes in sqlx
-  version order (skipping `*.down.sql`), applying `CREATE TABLE`,
-  `CREATE VIEW`, `ALTER TABLE`, and `DROP` statements. Definitions keep
-  their source locations. If `DATABASE_URL` (from the environment or `.env`) points
-  at a reachable database, the server also introspects it and fills in any
-  relations the migrations don't cover. SQLite files are opened read-only;
-  PostgreSQL is queried through its system catalogs on a session forced to
-  `default_transaction_read_only`, covering every table, view, and
-  materialized view visible on the search path; MySQL is queried through
-  `information_schema` on a `READ ONLY` session, covering the URL's
-  database. Passwords never appear in logs or error messages.
+Everything works in `.sql` files and *inside* sqlx's query macros in Rust
+files: tree-sitter finds the SQL strings of `query!`, `query_as!`,
+`query_scalar!` (and their `_unchecked` variants), and results map back to
+Rust buffer coordinates, layering cleanly on top of rust-analyzer.
+`query_file!` is served through the referenced `.sql` file instead.
+
 - **Completion** — context-aware: tables after `FROM`/`JOIN`/`INTO`/`UPDATE`,
-  columns of the qualified relation after `alias.` or `table.`, and in-scope
-  columns plus tables, keywords, and common functions elsewhere. Works on
-  syntactically incomplete statements.
-- **Hover** — reconstructed `CREATE`-statement summaries for tables and
-  views, SQL signatures for columns, with the defining migration named.
-- **Goto definition** — jumps from a table, alias, or column reference to the
-  defining statement in the migration that created it.
-- **Semantic tokens** — full-document highlighting with a lexical base layer
-  (keywords, literals, comments, operators, placeholders, type names) and an
-  AST overlay that classifies tables, columns, aliases, and function names —
-  including identifiers whose names collide with keywords.
+  a relation's columns after `alias.` or in an `INSERT` column list, and
+  in-scope columns, tables, keywords, and functions elsewhere. Works on
+  incomplete statements; accepting an item replaces the word being typed.
+- **Hover** — `CREATE`-shaped summaries for tables and views, signatures for
+  columns (naming the defining migration), and curated documentation for
+  keywords and built-in functions.
+- **Goto definition** — from any table, alias, or column reference to the
+  defining statement in its migration.
+- **Find references & document highlight** — every use of a table or column
+  across open documents and the crate's migration files. Aliases and
+  qualifiers count; CTEs stay scoped to their defining statement.
+- **Rename** — tables and columns, rewriting queries and migrations
+  together. Validates the new name (reserved words, collisions), refuses
+  objects that exist only in the live database, and sends versioned edits
+  to clients that support them.
+- **Diagnostics** — syntax errors, unknown tables and columns, and
+  bind-parameter counts checked against a macro's arguments. Served by push
+  and by pull (`textDocument/diagnostic`).
+- **Quick fixes** — closest-name suggestions for misspelled tables and
+  columns, ranked by edit distance.
+- **Semantic tokens** — a lexical base layer plus an AST overlay that
+  classifies tables, columns, aliases, and function names; full, delta, and
+  range requests.
+- **Symbols** — document outline of `CREATE` statements with their columns,
+  and workspace-wide search over every known table and column.
 
-- **Rust buffers** — all of the above also work *inside* sqlx's query macros
-  in Rust files. Tree-sitter locates the SQL string of `query!`, `query_as!`,
-  `query_scalar!` (and their `_unchecked` variants, bare or
-  `sqlx::`-qualified), and the features run on the embedded SQL with results
-  mapped back to Rust buffer coordinates. Semantic tokens cover only the SQL
-  strings, layering cleanly on top of rust-analyzer's highlighting. Raw
-  strings (`r#"..."#`) are handled losslessly; plain strings are read
-  verbatim, without decoding escape sequences. `query_file!` is intentionally
-  not handled here — the referenced `.sql` file is served directly.
+Under the hood:
 
-The schema index reloads automatically when migrations, `Cargo.toml`, or
-`.env` change (via client file watching, with a save-based fallback).
-
-All three backends — SQLite, PostgreSQL, and MySQL — are fully supported,
-including live introspection.
+- **Database detection** — `cargo metadata` reports the resolved features of
+  the `sqlx` dependency; `sqlite`, `postgres`, and `mysql` select the SQL
+  dialect, preferring `postgres` > `mysql` > `sqlite` when several are
+  enabled. Details under [How detection works](#how-detection-works).
+- **Per-crate contexts** — everything resolves relative to the invoking
+  crate, exactly like the sqlx macros: its `sqlx.toml`, its URL variable
+  (process environment or ancestor `.env` files), its migrations (including
+  `sqlx::migrate!()` targets), its backend. A workspace mixing postgres and
+  sqlite crates serves each crate against the right schema and dialect;
+  multi-root workspaces and folder changes mid-session are supported;
+  `SQLX_OFFLINE=true` disables live introspection per context.
+- **Schema index** — replays a crate's migrations in sqlx version order
+  and, when `DATABASE_URL` points at a reachable database, fills in the
+  relations migrations don't cover by read-only introspection — SQLite,
+  PostgreSQL, and MySQL are all supported, and passwords never appear in
+  logs. The index reloads automatically when migrations, `Cargo.toml`,
+  `sqlx.toml`, or `.env` change (client file watching, with a save-based
+  fallback).
+- **Protocol** — incremental document synchronization, UTF-8 position
+  encoding when the client prefers it, and work-done progress while the
+  index loads.
 
 ## Installation
 
@@ -130,7 +126,8 @@ cargo clippy --all-targets
 ```
 
 The crate is a thin binary over a library (`src/lib.rs`); the interesting
-modules are `db` (backend detection), `schema` (migration replay and the
-schema index), `introspect` (read-only SQLite introspection), `analysis/*`
-(the four language features), and `embedded` (tree-sitter extraction of SQL
-from Rust query macros).
+modules are `db` (backend detection), `workspace` (per-crate contexts),
+`schema/` (migration replay and the schema index), `introspect` (read-only
+introspection for all three backends), `analysis/*` (the language-feature
+implementations), `embedded` (tree-sitter extraction of SQL from Rust query
+macros), and `server` (the LSP surface).

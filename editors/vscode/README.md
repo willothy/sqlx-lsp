@@ -1,9 +1,10 @@
 # sqlx LSP for VS Code
 
 VS Code client for [sqlx-lsp](https://github.com/willothy/sqlx-lsp): SQL
-completion, hover, goto definition, and semantic highlighting for `.sql`
-files in sqlx projects — and inside `sqlx::query!` / `query_as!` /
-`query_scalar!` macros in Rust files, alongside rust-analyzer.
+completion, hover, goto definition, find references, rename, diagnostics
+with quick fixes, symbols, and semantic highlighting for `.sql` files in
+sqlx projects — and inside `sqlx::query!` / `query_as!` / `query_scalar!`
+macros in Rust files, alongside rust-analyzer.
 
 ## Setup
 
