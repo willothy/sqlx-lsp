@@ -697,6 +697,41 @@ fn rename_rewrites_references_across_documents_and_migrations() {
 }
 
 #[test]
+fn rename_rejects_reserved_words_and_collisions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_init.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);\n\
+         CREATE TABLE posts (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id, email FROM users");
+    let rename = |client: &mut LspClient, character: u32, new_name: &str| {
+        client.request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": query_uri },
+                "position": { "line": 0, "character": character },
+                "newName": new_name,
+            }),
+        )
+    };
+
+    // A reserved word is rejected.
+    assert!(rename(&mut client, 23, "select").is_null());
+    // A name already taken by another relation is rejected.
+    assert!(rename(&mut client, 23, "posts").is_null());
+    // A column rename cannot collide with a sibling column.
+    assert!(rename(&mut client, 7, "email").is_null());
+    // A clean rename still goes through.
+    assert!(!rename(&mut client, 23, "accounts").is_null());
+}
+
+#[test]
 fn rename_of_query_local_relations_stays_in_the_document() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");

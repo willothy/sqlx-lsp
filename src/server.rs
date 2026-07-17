@@ -1,6 +1,9 @@
 //! The language server backend.
 
 use dashmap::DashMap;
+use sqlparser::keywords::{
+    ALL_KEYWORDS, ALL_KEYWORDS_INDEX, RESERVED_FOR_COLUMN_ALIAS, RESERVED_FOR_TABLE_ALIAS,
+};
 use tokio::sync::{Notify, RwLock};
 use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
@@ -44,6 +47,19 @@ fn is_valid_identifier(name: &str) -> bool {
     };
     (first.is_ascii_alphabetic() || first == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `name` is a reserved SQL word, per sqlparser's core reserved
+/// sets (the keywords unusable as table or column aliases) — words like
+/// `SELECT` or `ORDER` that every supported backend reserves. Non-reserved
+/// keywords (`text`, `name`, ...) remain usable as identifiers.
+fn is_reserved_word(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let Ok(index) = ALL_KEYWORDS.binary_search(&upper.as_str()) else {
+        return false;
+    };
+    let keyword = ALL_KEYWORDS_INDEX[index];
+    RESERVED_FOR_TABLE_ALIAS.contains(&keyword) || RESERVED_FOR_COLUMN_ALIAS.contains(&keyword)
 }
 
 /// How an open document is served: as a SQL file, or as a Rust file whose
@@ -396,6 +412,34 @@ impl ServerState {
             )),
             TableOrigin::Migration | TableOrigin::Query => Ok(()),
         }
+    }
+
+    /// Whether renaming `resolved` to `new_name` collides with an existing
+    /// schema object: another relation with that name, or another column of
+    /// the same relation. Renaming into a collision would silently merge
+    /// every reference with the existing object's. Query-local relations are
+    /// exempt — shadowing a schema name is legal SQL. `Err` carries the
+    /// reason shown to the user.
+    fn collision(resolved: &Resolved, new_name: &str, context: &DbContext) -> Result<(), String> {
+        match resolved {
+            Resolved::Table { table, .. } => {
+                if table.origin != TableOrigin::Query
+                    && !table.name.eq_ignore_ascii_case(new_name)
+                    && context.schema.table(new_name).is_some()
+                {
+                    return Err(format!("a table or view named `{new_name}` already exists"));
+                }
+            }
+            Resolved::Column { table, column, .. } => {
+                if !column.name.eq_ignore_ascii_case(new_name) && table.column(new_name).is_some() {
+                    return Err(format!(
+                        "`{}` already has a column named `{new_name}`",
+                        table.name
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Extends `locations` with references to `target` found in every other
@@ -928,6 +972,19 @@ impl LanguageServer for Backend {
         };
         if let Err(message) = ServerState::renameable(&resolved) {
             return Err(jsonrpc::Error::invalid_params(message));
+        }
+        {
+            let workspace = self.workspace.read().await;
+            let context = workspace.context_for(&uri);
+            if is_reserved_word(&params.new_name) {
+                return Err(jsonrpc::Error::invalid_params(format!(
+                    "`{}` is a reserved word",
+                    params.new_name
+                )));
+            }
+            if let Err(message) = ServerState::collision(&resolved, &params.new_name, context) {
+                return Err(jsonrpc::Error::invalid_params(message));
+            }
         }
 
         // The edit set is the full reference set, declaration included —
