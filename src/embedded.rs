@@ -14,7 +14,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::analysis::semantic_tokens;
 use crate::db::DatabaseKind;
-use crate::document::Document;
+use crate::document::{AppliedEdit, Document};
 use crate::parse::ParsedSql;
 use crate::schema::Schema;
 
@@ -91,7 +91,7 @@ pub struct EmbeddedSql {
 
 /// Parses Rust source into a tree-sitter tree, or `None` when the runtime
 /// rejects the grammar (an ABI mismatch that pinned versions rule out).
-fn parse_rust(source: &str) -> Option<tree_sitter::Tree> {
+fn parse_rust(source: &str, previous: Option<&tree_sitter::Tree>) -> Option<tree_sitter::Tree> {
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -100,7 +100,29 @@ fn parse_rust(source: &str) -> Option<tree_sitter::Tree> {
         tracing::error!("tree-sitter-rust grammar is incompatible with the runtime");
         return None;
     }
-    parser.parse(source, None)
+    parser.parse(source, previous)
+}
+
+/// Converts an applied document edit into the shape tree-sitter uses to
+/// shift an existing tree before an incremental reparse.
+pub fn input_edit(edit: AppliedEdit) -> tree_sitter::InputEdit {
+    tree_sitter::InputEdit {
+        start_byte: edit.start_byte,
+        old_end_byte: edit.old_end_byte,
+        new_end_byte: edit.new_end_byte,
+        start_position: tree_sitter::Point {
+            row: edit.start_point.0,
+            column: edit.start_point.1,
+        },
+        old_end_position: tree_sitter::Point {
+            row: edit.old_end_point.0,
+            column: edit.old_end_point.1,
+        },
+        new_end_position: tree_sitter::Point {
+            row: edit.new_end_point.0,
+            column: edit.new_end_point.1,
+        },
+    }
 }
 
 impl EmbeddedSql {
@@ -108,8 +130,19 @@ impl EmbeddedSql {
     /// query macro invocation. Unparseable input yields whatever regions
     /// tree-sitter's error recovery still exposes.
     pub fn extract(document: &Document) -> EmbeddedSql {
-        let Some(tree) = parse_rust(document.text()) else {
-            return EmbeddedSql::default();
+        Self::extract_with(document, None).0
+    }
+
+    /// Like [`Self::extract`], seeded with the previous parse for an
+    /// incremental reparse. `previous` must have been shifted (via
+    /// [`tree_sitter::Tree::edit`] with [`input_edit`]) to match the
+    /// document's current text. The returned tree seeds the next call.
+    pub fn extract_with(
+        document: &Document,
+        previous: Option<&tree_sitter::Tree>,
+    ) -> (EmbeddedSql, Option<tree_sitter::Tree>) {
+        let Some(tree) = parse_rust(document.text(), previous) else {
+            return (EmbeddedSql::default(), None);
         };
 
         let source = document.text();
@@ -131,7 +164,7 @@ impl EmbeddedSql {
         }
         regions.sort_by_key(|region| (region.range.start.line, region.range.start.character));
 
-        EmbeddedSql { regions }
+        (EmbeddedSql { regions }, Some(tree))
     }
 
     /// The region containing `position`, if any.
@@ -206,7 +239,7 @@ pub enum MigrateSource {
 /// Extracts every `sqlx::migrate!` invocation (bare or path-qualified) from
 /// Rust `source`.
 pub fn migrate_sources(source: &str) -> Vec<MigrateSource> {
-    let Some(tree) = parse_rust(source) else {
+    let Some(tree) = parse_rust(source, None) else {
         return Vec::new();
     };
 
@@ -460,6 +493,28 @@ fn f() {
             Some("SELECT 2")
         );
         assert_eq!(embedded.region_at(Position::new(0, 3)), None);
+    }
+
+    #[test]
+    fn incremental_reparse_matches_a_full_parse() {
+        let source = r#"fn f() { sqlx::query!("SELECT id FROM users"); }"#;
+        let mut document = Document::new(source.to_owned());
+        let (first, tree) = EmbeddedSql::extract_with(&document, None);
+        let mut tree = tree.expect("tree");
+        assert_eq!(first.regions[0].text, "SELECT id FROM users");
+
+        // Replace `id` with `email`, shifting the tree the way the server
+        // does on ranged changes.
+        let edit = document.apply_change(
+            Range::new(Position::new(0, 30), Position::new(0, 32)),
+            "email",
+        );
+        tree.edit(&input_edit(edit));
+
+        let (incremental, _) = EmbeddedSql::extract_with(&document, Some(&tree));
+        let (fresh, _) = EmbeddedSql::extract_with(&document, None);
+        assert_eq!(incremental.regions, fresh.regions);
+        assert_eq!(incremental.regions[0].text, "SELECT email FROM users");
     }
 
     #[test]

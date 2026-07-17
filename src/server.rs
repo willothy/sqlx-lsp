@@ -8,7 +8,7 @@ use tower_lsp_server::ls_types::{
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, MessageType, OneOf, Registration, SemanticToken,
+    InitializeResult, InitializedParams, MessageType, OneOf, Range, Registration, SemanticToken,
     SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
@@ -63,6 +63,9 @@ struct OpenDocument {
     parsed_sql: Mutex<Option<(DatabaseKind, Arc<ParsedSql>)>>,
     /// The extracted query regions of the current text (Rust documents).
     extracted: Mutex<Option<Arc<EmbeddedSql>>>,
+    /// The syntax tree of the last extraction, kept aligned with the text
+    /// through [`tree_sitter::Tree::edit`] so reparses are incremental.
+    tree: Mutex<Option<tree_sitter::Tree>>,
     /// The most recently issued semantic-token stream and its result id,
     /// kept across edits so delta requests can diff against it.
     last_tokens: Mutex<Option<(String, Vec<SemanticToken>)>>,
@@ -75,7 +78,30 @@ impl OpenDocument {
             language,
             parsed_sql: Mutex::new(None),
             extracted: Mutex::new(None),
+            tree: Mutex::new(None),
             last_tokens: Mutex::new(None),
+        }
+    }
+
+    /// Applies one synchronized content change, keeping the cached syntax
+    /// tree aligned so the next extraction reparses incrementally.
+    fn apply_content_change(&mut self, range: Option<Range>, text: String) {
+        match range {
+            Some(range) => {
+                let edit = self.document.apply_change(range, &text);
+                if let Some(tree) = self
+                    .tree
+                    .get_mut()
+                    .expect("tree cache lock poisoned")
+                    .as_mut()
+                {
+                    tree.edit(&embedded::input_edit(edit));
+                }
+            }
+            None => {
+                self.document.update(text);
+                *self.tree.get_mut().expect("tree cache lock poisoned") = None;
+            }
         }
     }
 
@@ -94,13 +120,17 @@ impl OpenDocument {
     }
 
     /// The extracted SQL regions of the current text, computed at most once
-    /// per text.
+    /// per text, reparsing incrementally from the previous tree when the
+    /// text changed through ranged edits.
     fn extracted(&self) -> Arc<EmbeddedSql> {
         let mut cache = self.extracted.lock().expect("region cache lock poisoned");
         if let Some(extracted) = &*cache {
             return Arc::clone(extracted);
         }
-        let extracted = Arc::new(EmbeddedSql::extract(&self.document));
+        let mut tree = self.tree.lock().expect("tree cache lock poisoned");
+        let (extracted, new_tree) = EmbeddedSql::extract_with(&self.document, tree.as_ref());
+        *tree = new_tree;
+        let extracted = Arc::new(extracted);
         *cache = Some(Arc::clone(&extracted));
         extracted
     }
@@ -423,12 +453,7 @@ impl LanguageServer for Backend {
                 // state left by the previous change. A change without a
                 // range replaces the whole text.
                 for change in params.content_changes {
-                    match change.range {
-                        Some(range) => {
-                            open.document.apply_change(range, &change.text);
-                        }
-                        None => open.document.update(change.text),
-                    }
+                    open.apply_content_change(change.range, change.text);
                 }
                 open.invalidate();
             }
