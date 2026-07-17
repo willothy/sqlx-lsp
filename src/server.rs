@@ -8,13 +8,14 @@ use tower_lsp_server::ls_types::{
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, MessageType, OneOf, Range, Registration, SemanticToken,
-    SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Unregistration,
-    Uri, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    InitializeResult, InitializedParams, MessageType, OneOf, ProgressToken, Range, Registration,
+    SemanticToken, SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, Unregistration, Uri, WorkDoneProgressOptions,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
@@ -178,6 +179,10 @@ pub struct ServerState {
     /// Issues result ids for semantic-token streams; ids only need to be
     /// unique per session.
     next_tokens_id: AtomicU64,
+    /// Whether the client accepts server-initiated work-done progress.
+    progress_supported: AtomicBool,
+    /// Issues unique progress tokens for reloads.
+    next_progress_id: AtomicU64,
 }
 
 impl Backend {
@@ -190,6 +195,8 @@ impl Backend {
             watchers_unavailable: AtomicBool::new(false),
             reload_notify: Notify::new(),
             next_tokens_id: AtomicU64::new(0),
+            progress_supported: AtomicBool::new(false),
+            next_progress_id: AtomicU64::new(0),
         });
 
         // Reloads run here rather than in notification handlers: a slow
@@ -254,12 +261,40 @@ impl ServerState {
             return;
         }
 
+        // Loads can take seconds (cargo metadata, live introspection); show
+        // progress when the client supports server-initiated reporting.
+        let progress = if self.progress_supported.load(Ordering::Relaxed) {
+            let token = ProgressToken::String(format!(
+                "sqlx-lsp/reload/{}",
+                self.next_progress_id.fetch_add(1, Ordering::Relaxed)
+            ));
+            match self.client.create_work_done_progress(token.clone()).await {
+                Ok(()) => Some(
+                    self.client
+                        .progress(token, "sqlx-lsp: loading workspace")
+                        .with_message(format!("indexing {} folder(s)", roots.len()))
+                        .begin()
+                        .await,
+                ),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         let (workspace, log) = Workspace::load(roots).await;
+        let contexts = workspace.contexts.len();
         *self.workspace.write().await = workspace;
         for (message_type, message) in log {
             self.client.log_message(message_type, message).await;
         }
         self.register_watchers().await;
+
+        if let Some(progress) = progress {
+            progress
+                .finish_with_message(format!("{contexts} context(s)"))
+                .await;
+        }
     }
 
     /// (Re)registers the watched-file globs: the conventional schema sources
@@ -381,6 +416,14 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         self.watchers_unavailable
             .store(!watched_files_registration, Ordering::Relaxed);
+        let progress_supported = params
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|window| window.work_done_progress)
+            .unwrap_or(false);
+        self.progress_supported
+            .store(progress_supported, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {

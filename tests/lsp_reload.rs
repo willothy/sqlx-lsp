@@ -28,6 +28,15 @@ impl LspClient {
     /// Spawns the server, runs the initialize handshake for `root`, and
     /// waits for the initial workspace load to finish.
     fn start(root: &Path) -> LspClient {
+        let mut client = Self::start_with_capabilities(root, json!({}));
+        client.wait_for_load();
+        client
+    }
+
+    /// Spawns the server and initializes it with the given client
+    /// capabilities, without waiting for the initial load — the caller can
+    /// observe every message the load produces.
+    fn start_with_capabilities(root: &Path, capabilities: Value) -> LspClient {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sqlx-lsp"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -89,12 +98,11 @@ impl LspClient {
             json!({
                 "processId": null,
                 "rootUri": root_uri,
-                "capabilities": {},
+                "capabilities": capabilities,
                 "workspaceFolders": [{ "uri": root_uri, "name": "fixture" }],
             }),
         );
         client.notify("initialized", json!({}));
-        client.wait_for_load();
         client
     }
 
@@ -338,6 +346,46 @@ fn exits_cleanly_on_the_exit_notification() {
         .wait_for_exit(Duration::from_secs(10))
         .expect("server exits after the exit notification");
     assert!(status.success(), "unexpected exit status: {status}");
+}
+
+#[test]
+fn reloads_report_work_done_progress() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut client = LspClient::start_with_capabilities(
+        dir.path(),
+        json!({ "window": { "workDoneProgress": true } }),
+    );
+
+    // Observe every message of the initial load: a progress begin and end
+    // must arrive before the load summary.
+    let mut kinds = Vec::new();
+    loop {
+        let message = client.next_message();
+        if message["method"] == "$/progress"
+            && let Some(kind) = message["params"]["value"]["kind"].as_str()
+        {
+            kinds.push(kind.to_owned());
+        }
+        let is_summary = message["method"] == "window/logMessage"
+            && message["params"]["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("workspace-wide index holds"));
+        if is_summary {
+            break;
+        }
+    }
+    assert!(kinds.contains(&"begin".to_owned()), "{kinds:?}");
+
+    // The end notification may arrive just after the summary; drain until
+    // it shows up.
+    while !kinds.contains(&"end".to_owned()) {
+        let message = client.next_message();
+        if message["method"] == "$/progress"
+            && let Some(kind) = message["params"]["value"]["kind"].as_str()
+        {
+            kinds.push(kind.to_owned());
+        }
+    }
 }
 
 #[test]
