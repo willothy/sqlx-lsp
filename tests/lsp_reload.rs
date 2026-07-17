@@ -366,6 +366,64 @@ fn schema_changes_reload_while_the_session_is_open() {
 }
 
 #[test]
+fn reference_results_track_migration_edits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    let migration = dir.path().join("migrations").join("1_users.sql");
+    std::fs::write(&migration, "CREATE TABLE users (id INTEGER PRIMARY KEY);")
+        .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM users");
+
+    let migration_references = |client: &mut LspClient| {
+        client
+            .request(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": query_uri },
+                    "position": { "line": 0, "character": 17 },
+                    "context": { "includeDeclaration": true },
+                }),
+            )
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|location| {
+                location["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.ends_with("1_users.sql"))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let locations = migration_references(&mut client);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0]["range"]["start"]["line"], 0, "{locations:?}");
+
+    // The migration is rewritten on disk, moving the definition down a
+    // line. The reload must refresh the cached migration contents — a
+    // stale cache would keep reporting a line-0 reference alongside the
+    // relocated declaration.
+    std::fs::write(
+        &migration,
+        "-- users of the app\nCREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("rewrite migration");
+    client.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({ "changes": [{ "uri": file_uri(&migration), "type": 2 }] }),
+    );
+    client.wait_for_load();
+
+    let locations = migration_references(&mut client);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0]["range"]["start"]["line"], 1, "{locations:?}");
+}
+
+#[test]
 fn exits_cleanly_on_the_exit_notification() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut client = LspClient::start(dir.path());
