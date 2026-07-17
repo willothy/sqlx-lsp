@@ -215,6 +215,23 @@ impl LspClient {
     }
 }
 
+impl LspClient {
+    /// Waits for the server process to exit on its own, returning its
+    /// status, or `None` if it is still running when `timeout` elapses.
+    fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 impl Drop for LspClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -283,6 +300,20 @@ fn schema_changes_reload_while_the_session_is_open() {
     assert!(hover.contains("users.email TEXT NOT NULL"), "{hover}");
     // The definition location tracks the rewritten file.
     assert!(hover.contains("0001_users.sql"), "{hover}");
+}
+
+#[test]
+fn exits_cleanly_on_the_exit_notification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut client = LspClient::start(dir.path());
+
+    client.request("shutdown", Value::Null);
+    client.notify("exit", Value::Null);
+
+    let status = client
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("server exits after the exit notification");
+    assert!(status.success(), "unexpected exit status: {status}");
 }
 
 #[test]
