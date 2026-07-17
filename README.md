@@ -28,6 +28,9 @@ index from your migrations, and serves editor features against that schema.
   right schema and dialect. Documents outside any sqlx crate get a
   workspace-wide context that merges everything. `SQLX_OFFLINE=true`
   disables live introspection for a context, matching the macros' contract.
+  Multi-root workspaces are fully supported: every workspace folder gets its
+  own contexts, and folders added or removed mid-session
+  (`workspace/didChangeWorkspaceFolders`) rebuild the index immediately.
 - **Schema index** — replays the `.sql` migrations a crate consumes in sqlx
   version order (skipping `*.down.sql`), applying `CREATE TABLE`,
   `CREATE VIEW`, `ALTER TABLE`, and `DROP` statements. Definitions keep
