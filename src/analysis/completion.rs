@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::Token;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, Position, Range,
+    CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, MarkupContent,
+    MarkupKind, Position, Range, TextEdit,
 };
 
 use crate::db::DatabaseKind;
@@ -180,6 +181,14 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// The range of the word being typed at `position`, when the cursor
+    /// sits inside or at the end of one.
+    fn word_range(&self, position: Position) -> Option<Range> {
+        let index = self.last_before?;
+        let (token, range) = &self.tokens[index];
+        (matches!(token, Token::Word(_)) && position <= range.end).then_some(*range)
+    }
+
     /// The relations referenced by this statement, scanned from tokens:
     /// every `FROM`/`JOIN`/`INTO`/`UPDATE` target with its optional alias,
     /// including comma-separated `FROM` lists. Keys and values are
@@ -239,7 +248,18 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn table_item(table: &Table, sort_group: char) -> CompletionItem {
+/// The explicit edit for accepting a completion: replace the word being
+/// typed (or insert at the cursor) with `new_text`. Explicit ranges keep
+/// multi-word completions ("GROUP BY") from duplicating already-typed text
+/// under clients' word-boundary heuristics.
+fn accept_edit(replace: Range, new_text: &str) -> Option<CompletionTextEdit> {
+    Some(CompletionTextEdit::Edit(TextEdit {
+        range: replace,
+        new_text: new_text.to_owned(),
+    }))
+}
+
+fn table_item(table: &Table, sort_group: char, replace: Range) -> CompletionItem {
     CompletionItem {
         label: table.name.clone(),
         kind: Some(match table.kind {
@@ -258,11 +278,12 @@ fn table_item(table: &Table, sort_group: char) -> CompletionItem {
             value: format!("```sql\n{}\n```", table.ddl()),
         })),
         sort_text: Some(format!("{sort_group}{}", table.name)),
+        text_edit: accept_edit(replace, &table.name),
         ..CompletionItem::default()
     }
 }
 
-fn column_item(table: &Table, column: &Column, sort_group: char) -> CompletionItem {
+fn column_item(table: &Table, column: &Column, sort_group: char, replace: Range) -> CompletionItem {
     CompletionItem {
         label: column.name.clone(),
         kind: Some(CompletionItemKind::FIELD),
@@ -272,6 +293,7 @@ fn column_item(table: &Table, column: &Column, sort_group: char) -> CompletionIt
             value: format!("column of `{}`", table.name),
         })),
         sort_text: Some(format!("{sort_group}{}", column.name)),
+        text_edit: accept_edit(replace, &column.name),
         ..CompletionItem::default()
     }
 }
@@ -285,18 +307,20 @@ fn dialect_keywords(kind: DatabaseKind) -> &'static [&'static str] {
     }
 }
 
-fn keyword_items(items: &mut Vec<CompletionItem>, kind: DatabaseKind) {
+fn keyword_items(items: &mut Vec<CompletionItem>, kind: DatabaseKind, replace: Range) {
     let keywords = KEYWORDS.iter().chain(dialect_keywords(kind));
     items.extend(keywords.map(|keyword| CompletionItem {
         label: (*keyword).to_owned(),
         kind: Some(CompletionItemKind::KEYWORD),
         sort_text: Some(format!("3{keyword}")),
+        text_edit: accept_edit(replace, keyword),
         ..CompletionItem::default()
     }));
     items.extend(FUNCTIONS.iter().map(|function| CompletionItem {
         label: (*function).to_owned(),
         kind: Some(CompletionItemKind::FUNCTION),
         sort_text: Some(format!("4{function}")),
+        text_edit: accept_edit(replace, function),
         ..CompletionItem::default()
     }));
 }
@@ -329,11 +353,18 @@ pub fn completions(
             })
     };
 
+    // Accepting an item replaces the word being typed, or inserts at the
+    // cursor when there is none.
+    let replace = cursor.word_range(position).unwrap_or(Range {
+        start: position,
+        end: position,
+    });
+
     let mut items = Vec::new();
     match cursor.context(position) {
         Context::TableName => {
-            items.extend(locals.iter().map(|table| table_item(table, '1')));
-            items.extend(schema.tables().map(|table| table_item(table, '1')));
+            items.extend(locals.iter().map(|table| table_item(table, '1', replace)));
+            items.extend(schema.tables().map(|table| table_item(table, '1', replace)));
         }
         Context::QualifiedColumn { qualifier } => {
             // Only the qualified relation's columns make sense here; if the
@@ -343,7 +374,7 @@ pub fn completions(
                     table
                         .columns
                         .iter()
-                        .map(|column| column_item(table, column, '1')),
+                        .map(|column| column_item(table, column, '1', replace)),
                 );
             }
         }
@@ -355,12 +386,12 @@ pub fn completions(
                 for column in &table.columns {
                     seen_columns
                         .entry(column.name.to_ascii_lowercase())
-                        .or_insert_with(|| column_item(table, column, '1'));
+                        .or_insert_with(|| column_item(table, column, '1', replace));
                 }
             }
             items.extend(seen_columns.into_values());
-            items.extend(schema.tables().map(|table| table_item(table, '2')));
-            keyword_items(&mut items, kind);
+            items.extend(schema.tables().map(|table| table_item(table, '2', replace)));
+            keyword_items(&mut items, kind, replace);
         }
     }
     items
@@ -498,6 +529,52 @@ mod tests {
         let labels = labels_at("WITH recent AS (SELECT id FROM posts) SELECT id FROM re|");
         assert!(labels.contains(&"recent".to_owned()));
         assert!(labels.contains(&"users".to_owned()));
+    }
+
+    #[test]
+    fn items_replace_the_word_being_typed() {
+        // "SELECT id FROM us|" — accepting an item must replace `us`.
+        let sql = "SELECT id FROM us";
+        let document = Document::new(sql.to_owned());
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        let items = completions(
+            &document,
+            &parsed,
+            Position::new(0, 17),
+            &schema(),
+            DatabaseKind::Sqlite,
+        );
+        let users = items
+            .iter()
+            .find(|item| item.label == "users")
+            .expect("users offered");
+        let Some(CompletionTextEdit::Edit(edit)) = &users.text_edit else {
+            panic!("expected a plain text edit");
+        };
+        assert_eq!(edit.range.start, Position::new(0, 15));
+        assert_eq!(edit.range.end, Position::new(0, 17));
+        assert_eq!(edit.new_text, "users");
+
+        // With no word under the cursor the edit inserts at the position.
+        let sql = "SELECT id FROM ";
+        let document = Document::new(sql.to_owned());
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        let items = completions(
+            &document,
+            &parsed,
+            Position::new(0, 15),
+            &schema(),
+            DatabaseKind::Sqlite,
+        );
+        let users = items
+            .iter()
+            .find(|item| item.label == "users")
+            .expect("users offered");
+        let Some(CompletionTextEdit::Edit(edit)) = &users.text_edit else {
+            panic!("expected a plain text edit");
+        };
+        assert_eq!(edit.range.start, Position::new(0, 15));
+        assert_eq!(edit.range.end, Position::new(0, 15));
     }
 
     #[test]
