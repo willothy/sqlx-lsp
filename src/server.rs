@@ -10,24 +10,25 @@ use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FileSystemWatcher, GlobPattern,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf, Position,
-    PrepareRenameResponse, ProgressToken, Range, ReferenceParams, Registration, RenameOptions,
-    RenameParams, SemanticToken, SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams,
+    DidSaveTextDocumentParams, DocumentChanges, DocumentHighlight, DocumentHighlightKind,
+    DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse, FileSystemWatcher,
+    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
+    MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Position, PrepareRenameResponse,
+    ProgressToken, Range, ReferenceParams, Registration, RenameOptions, RenameParams,
+    SemanticToken, SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams,
     SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
     SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SymbolInformation, SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit,
-    Unregistration, Uri, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    SymbolInformation, SymbolKind, TextDocumentEdit, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Unregistration, Uri, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -96,6 +97,8 @@ impl DocumentLanguage {
 struct OpenDocument {
     document: Document,
     language: DocumentLanguage,
+    /// The client's version of the document, echoed in versioned edits.
+    version: i32,
     /// The SQL parse of the current text, keyed by the dialect it was
     /// parsed under (the context kind can change across reloads).
     parsed_sql: Mutex<Option<(DatabaseKind, Arc<ParsedSql>)>>,
@@ -110,10 +113,11 @@ struct OpenDocument {
 }
 
 impl OpenDocument {
-    fn new(document: Document, language: DocumentLanguage) -> OpenDocument {
+    fn new(document: Document, language: DocumentLanguage, version: i32) -> OpenDocument {
         OpenDocument {
             document,
             language,
+            version,
             parsed_sql: Mutex::new(None),
             extracted: Mutex::new(None),
             tree: Mutex::new(None),
@@ -220,6 +224,9 @@ pub struct ServerState {
     progress_supported: AtomicBool,
     /// Issues unique progress tokens for reloads.
     next_progress_id: AtomicU64,
+    /// Whether the client accepts versioned `documentChanges` in workspace
+    /// edits.
+    document_changes_supported: AtomicBool,
 }
 
 impl Backend {
@@ -234,6 +241,7 @@ impl Backend {
             next_tokens_id: AtomicU64::new(0),
             progress_supported: AtomicBool::new(false),
             next_progress_id: AtomicU64::new(0),
+            document_changes_supported: AtomicBool::new(false),
         });
 
         // Reloads run here rather than in notification handlers: a slow
@@ -710,6 +718,15 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         self.progress_supported
             .store(progress_supported, Ordering::Relaxed);
+        let document_changes_supported = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_edit.as_ref())
+            .and_then(|edit| edit.document_changes)
+            .unwrap_or(false);
+        self.document_changes_supported
+            .store(document_changes_supported, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -780,7 +797,7 @@ impl LanguageServer for Backend {
         let uri = document.uri.clone();
         self.documents.insert(
             document.uri,
-            OpenDocument::new(Document::new(document.text), language),
+            OpenDocument::new(Document::new(document.text), language, document.version),
         );
         self.publish_diagnostics_for(&uri).await;
     }
@@ -795,6 +812,7 @@ impl LanguageServer for Backend {
                 for change in params.content_changes {
                     open.apply_content_change(change.range, change.text);
                 }
+                open.version = params.text_document.version;
                 open.invalidate();
             }
             None => {
@@ -810,7 +828,11 @@ impl LanguageServer for Backend {
                 let language = DocumentLanguage::detect(None, &uri);
                 self.documents.insert(
                     uri.clone(),
-                    OpenDocument::new(Document::new(change.text), language),
+                    OpenDocument::new(
+                        Document::new(change.text),
+                        language,
+                        params.text_document.version,
+                    ),
                 );
             }
         }
@@ -1141,17 +1163,43 @@ impl LanguageServer for Backend {
         if locations.is_empty() {
             return Ok(None);
         }
-        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        // Locations arrive sorted by URI, so adjacent grouping is complete.
+        let mut grouped: Vec<(Uri, Vec<TextEdit>)> = Vec::new();
         for location in locations {
-            changes.entry(location.uri).or_default().push(TextEdit {
+            let edit = TextEdit {
                 range: location.range,
                 new_text: params.new_name.clone(),
-            });
+            };
+            match grouped.last_mut() {
+                Some((uri, edits)) if *uri == location.uri => edits.push(edit),
+                _ => grouped.push((location.uri, vec![edit])),
+            }
         }
-        Ok(Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..WorkspaceEdit::default()
-        }))
+
+        // Versioned document edits let the client refuse a rename computed
+        // against a buffer state it has since changed; the plain changes
+        // map serves clients without that support.
+        if self.document_changes_supported.load(Ordering::Relaxed) {
+            let edits = grouped
+                .into_iter()
+                .map(|(uri, edits)| TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        version: self.documents.get(&uri).map(|open| open.version),
+                        uri,
+                    },
+                    edits: edits.into_iter().map(OneOf::Left).collect(),
+                })
+                .collect();
+            Ok(Some(WorkspaceEdit {
+                document_changes: Some(DocumentChanges::Edits(edits)),
+                ..WorkspaceEdit::default()
+            }))
+        } else {
+            Ok(Some(WorkspaceEdit {
+                changes: Some(grouped.into_iter().collect()),
+                ..WorkspaceEdit::default()
+            }))
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {

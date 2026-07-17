@@ -868,6 +868,54 @@ fn rename_rejects_reserved_words_and_collisions() {
 }
 
 #[test]
+fn rename_uses_versioned_edits_when_the_client_supports_them() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start_with_capabilities(
+        dir.path(),
+        json!({ "workspace": { "workspaceEdit": { "documentChanges": true } } }),
+    );
+    client.wait_for_load();
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT 1 FROM users");
+    client.change(&query_uri, 7, "SELECT id FROM users");
+
+    let edit = client.request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 17 },
+            "newName": "accounts",
+        }),
+    );
+    assert!(edit["changes"].is_null(), "{edit:?}");
+    let document_edits = edit["documentChanges"].as_array().expect("documentChanges");
+    assert_eq!(document_edits.len(), 2, "{document_edits:?}");
+
+    // The open buffer's edit carries its latest synchronized version; the
+    // unopened migration file carries null.
+    let for_query = document_edits
+        .iter()
+        .find(|edit| edit["textDocument"]["uri"] == query_uri)
+        .expect("query edit");
+    assert_eq!(for_query["textDocument"]["version"], 7, "{for_query:?}");
+    let for_migration = document_edits
+        .iter()
+        .find(|edit| edit["textDocument"]["uri"] != query_uri)
+        .expect("migration edit");
+    assert!(
+        for_migration["textDocument"]["version"].is_null(),
+        "{for_migration:?}"
+    );
+}
+
+#[test]
 fn rename_of_query_local_relations_stays_in_the_document() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
