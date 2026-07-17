@@ -7,24 +7,27 @@ use sqlparser::keywords::{
 use tokio::sync::{Notify, RwLock};
 use tower_lsp_server::ls_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
-    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
-    DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentChanges, DocumentHighlight, DocumentHighlightKind,
+    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DiagnosticOptions,
+    DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentChanges, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentDiagnosticReportResult, DocumentHighlight, DocumentHighlightKind,
     DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse, FileSystemWatcher,
-    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
-    MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Position, PrepareRenameResponse,
-    ProgressToken, Range, ReferenceParams, Registration, RenameOptions, RenameParams,
-    SemanticToken, SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SymbolInformation, SymbolKind, TextDocumentEdit, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, Unregistration, Uri, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    FullDocumentDiagnosticReport, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
+    PrepareRenameResponse, ProgressToken, Range, ReferenceParams, Registration,
+    RelatedFullDocumentDiagnosticReport, RenameOptions, RenameParams, SemanticToken,
+    SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentEdit, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit,
+    Unregistration, Uri, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
@@ -227,6 +230,9 @@ pub struct ServerState {
     /// Whether the client accepts versioned `documentChanges` in workspace
     /// edits.
     document_changes_supported: AtomicBool,
+    /// Whether the client pulls diagnostics (`textDocument/diagnostic`);
+    /// pushes are suppressed then, so documents are not reported twice.
+    pull_diagnostics_supported: AtomicBool,
 }
 
 impl Backend {
@@ -242,6 +248,7 @@ impl Backend {
             progress_supported: AtomicBool::new(false),
             next_progress_id: AtomicU64::new(0),
             document_changes_supported: AtomicBool::new(false),
+            pull_diagnostics_supported: AtomicBool::new(false),
         });
 
         // Reloads run here rather than in notification handlers: a slow
@@ -267,26 +274,34 @@ impl ServerState {
 
     /// Computes and publishes diagnostics for one open document.
     async fn publish_diagnostics_for(&self, uri: &Uri) {
-        let diagnostics = {
-            let Some(open) = self.documents.get(uri) else {
-                return;
-            };
-            let workspace = self.workspace.read().await;
-            let context = workspace.context_for(uri);
-            match open.language {
-                DocumentLanguage::Sql => {
-                    let parsed = open.parsed(context.kind);
-                    diagnostics::diagnostics(&open.document, &parsed, &context.schema)
-                }
-                DocumentLanguage::Rust => {
-                    let extracted = open.extracted();
-                    embedded::diagnostics(&extracted, &context.schema, context.kind)
-                }
-            }
+        // Clients that pull diagnostics must not also receive pushes for
+        // the same documents.
+        if self.pull_diagnostics_supported.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(diagnostics) = self.diagnostics_for(uri).await else {
+            return;
         };
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+    }
+
+    /// The current diagnostics for `uri`, or `None` when it is not open.
+    async fn diagnostics_for(&self, uri: &Uri) -> Option<Vec<Diagnostic>> {
+        let open = self.documents.get(uri)?;
+        let workspace = self.workspace.read().await;
+        let context = workspace.context_for(uri);
+        Some(match open.language {
+            DocumentLanguage::Sql => {
+                let parsed = open.parsed(context.kind);
+                diagnostics::diagnostics(&open.document, &parsed, &context.schema)
+            }
+            DocumentLanguage::Rust => {
+                let extracted = open.extracted();
+                embedded::diagnostics(&extracted, &context.schema, context.kind)
+            }
+        })
     }
 
     /// Republishes diagnostics for every open document, after the schema
@@ -727,6 +742,13 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         self.document_changes_supported
             .store(document_changes_supported, Ordering::Relaxed);
+        let pull_diagnostics_supported = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .is_some_and(|text_document| text_document.diagnostic.is_some());
+        self.pull_diagnostics_supported
+            .store(pull_diagnostics_supported, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -745,6 +767,16 @@ impl LanguageServer for Backend {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: Some("sqlx-lsp".to_owned()),
+                        // Migration edits change the schema other documents
+                        // resolve against.
+                        inter_file_dependencies: true,
+                        workspace_diagnostics: false,
+                        work_done_progress_options: WorkDoneProgressOptions::default(),
+                    },
+                )),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -847,10 +879,13 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.remove(&params.text_document.uri);
-        // Closed documents keep no diagnostics.
-        self.client
-            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
-            .await;
+        // Closed documents keep no diagnostics; pulling clients discard
+        // them on close themselves.
+        if !self.pull_diagnostics_supported.load(Ordering::Relaxed) {
+            self.client
+                .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+                .await;
+        }
     }
 
     async fn completion(
@@ -1020,6 +1055,25 @@ impl LanguageServer for Backend {
                 ))
         });
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> jsonrpc::Result<DocumentDiagnosticReportResult> {
+        let items = self
+            .diagnostics_for(&params.text_document.uri)
+            .await
+            .unwrap_or_default();
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items,
+                },
+            }),
+        ))
     }
 
     async fn code_action(

@@ -678,6 +678,50 @@ fn workspace_symbols_search_the_schema_index() {
 }
 
 #[test]
+fn pull_diagnostics_report_the_current_document_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start_with_capabilities(
+        dir.path(),
+        json!({ "textDocument": { "diagnostic": {} } }),
+    );
+    client.wait_for_load();
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM posts");
+
+    let report = client.request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": query_uri } }),
+    );
+    assert_eq!(report["kind"], "full", "{report:?}");
+    let items = report["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(
+        items[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown table")),
+        "{items:?}"
+    );
+
+    // After a fix, the next pull reports clean.
+    client.change(&query_uri, 2, "SELECT id FROM users");
+    let report = client.request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": query_uri } }),
+    );
+    assert!(
+        report["items"].as_array().is_some_and(Vec::is_empty),
+        "{report:?}"
+    );
+}
+
+#[test]
 fn quick_fixes_suggest_replacements_for_misspelled_names() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
