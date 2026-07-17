@@ -14,6 +14,7 @@ use tower_lsp_server::ls_types::{
 };
 use tree_sitter::{Node, Parser};
 
+use crate::analysis::resolve::ReferenceTarget;
 use crate::analysis::semantic_tokens;
 use crate::db::DatabaseKind;
 use crate::document::{AppliedEdit, Document};
@@ -361,6 +362,59 @@ pub fn diagnostics(embedded: &EmbeddedSql, schema: &Schema, kind: DatabaseKind) 
         {
             diagnostic.range = region.to_host_range(diagnostic.range);
             all.push(diagnostic);
+        }
+    }
+    all
+}
+
+/// The reference target named at `position`, together with every range in
+/// this document that resolves to it, mapped to host coordinates.
+///
+/// A document-local target (a CTE or derived-table alias) is searched only
+/// within its defining region; a schema target across every region.
+pub fn references_at(
+    embedded: &EmbeddedSql,
+    position: Position,
+    schema: &Schema,
+    kind: DatabaseKind,
+) -> Option<(ReferenceTarget, Vec<Range>)> {
+    let region = embedded.region_at(position)?;
+    let sql_document = Document::new(region.text.clone());
+    let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
+    let target = crate::analysis::resolve::reference_target(
+        &sql_document,
+        &parsed,
+        region.to_embedded(position),
+        schema,
+    )?;
+    let ranges = if target.is_document_local() {
+        crate::analysis::resolve::references_to(&sql_document, &parsed, schema, &target)
+            .into_iter()
+            .map(|range| region.to_host_range(range))
+            .collect()
+    } else {
+        references_to(embedded, schema, kind, &target)
+    };
+    Some((target, ranges))
+}
+
+/// Every range across the document's SQL regions that resolves to `target`,
+/// mapped to host coordinates. Only meaningful for schema targets; a
+/// document-local target's statement index would falsely match unrelated
+/// regions.
+pub fn references_to(
+    embedded: &EmbeddedSql,
+    schema: &Schema,
+    kind: DatabaseKind,
+    target: &ReferenceTarget,
+) -> Vec<Range> {
+    let mut all = Vec::new();
+    for region in &embedded.regions {
+        let sql_document = Document::new(region.text.clone());
+        let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
+        for range in crate::analysis::resolve::references_to(&sql_document, &parsed, schema, target)
+        {
+            all.push(region.to_host_range(range));
         }
     }
     all

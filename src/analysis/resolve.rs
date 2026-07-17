@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, Expr, Ident, ObjectName, Statement, TableFactor, TableObject, Visit,
-    Visitor,
+    AlterTableOperation, AssignmentTarget, Expr, Ident, ObjectName, Statement, TableFactor,
+    TableObject, Visit, Visitor,
 };
 use sqlparser::tokenizer::Span;
 use tower_lsp_server::ls_types::{Position, Range};
@@ -157,6 +157,51 @@ impl<'s> References<'s> {
         }
     }
 
+    /// The column targets of `UPDATE ... SET` assignments. The value side of
+    /// an assignment is visited as ordinary expressions, but the target side
+    /// is not an `Expr` and would otherwise go unrecorded.
+    fn record_assignment_targets(&mut self, statement: &Statement) {
+        let Statement::Update(update) = statement else {
+            return;
+        };
+        for assignment in &update.assignments {
+            let names = match &assignment.target {
+                AssignmentTarget::ColumnName(name) => std::slice::from_ref(name),
+                AssignmentTarget::Tuple(names) => names.as_slice(),
+            };
+            for name in names {
+                let parts: Vec<&Ident> = name.0.iter().filter_map(|part| part.as_ident()).collect();
+                // `column` or `table.column`; anything earlier is a
+                // schema/database qualifier the index doesn't model.
+                match parts.as_slice() {
+                    [column] => self.record(
+                        column.span,
+                        CandidateKind::Column {
+                            qualifier: None,
+                            name: column.value.clone(),
+                        },
+                    ),
+                    [.., qualifier, column] => {
+                        self.record(
+                            qualifier.span,
+                            CandidateKind::Table {
+                                name: qualifier.value.clone(),
+                            },
+                        );
+                        self.record(
+                            column.span,
+                            CandidateKind::Column {
+                                qualifier: Some(qualifier.value.clone()),
+                                name: column.value.clone(),
+                            },
+                        );
+                    }
+                    [] => {}
+                }
+            }
+        }
+    }
+
     fn record_column_defs(&mut self, statement: &Statement) {
         let (table_name, column_idents): (Option<String>, Vec<_>) = match statement {
             Statement::CreateTable(create) => (
@@ -290,6 +335,7 @@ impl Visitor for References<'_> {
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
         self.record_column_defs(statement);
+        self.record_assignment_targets(statement);
         ControlFlow::Continue(())
     }
 
@@ -470,6 +516,156 @@ pub fn query_local_tables(statements: &[Statement], schema: &Schema) -> Vec<Tabl
         .collect()
 }
 
+/// The identity of the object a reference names, used to match references
+/// to the same object across documents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceTarget {
+    /// A schema table or view.
+    Table {
+        /// The relation name as recorded in the schema index.
+        name: String,
+    },
+    /// A column of a schema table or view.
+    Column {
+        /// The owning relation's name.
+        table: String,
+        /// The column name.
+        column: String,
+    },
+    /// A query-local relation (CTE or derived-table alias); it exists only
+    /// inside the statement that defines it.
+    LocalTable {
+        /// The local relation's name.
+        name: String,
+        /// Index of the defining statement within its document.
+        statement: usize,
+    },
+    /// A column of a query-local relation.
+    LocalColumn {
+        /// The local relation's name.
+        table: String,
+        /// The column name.
+        column: String,
+        /// Index of the defining statement within its document.
+        statement: usize,
+    },
+}
+
+impl ReferenceTarget {
+    /// Whether the target exists only inside its defining document, making
+    /// a cross-document search meaningless.
+    pub fn is_document_local(&self) -> bool {
+        matches!(
+            self,
+            ReferenceTarget::LocalTable { .. } | ReferenceTarget::LocalColumn { .. }
+        )
+    }
+}
+
+/// The identity of the object referenced at `position`, or `None` when the
+/// identifier there resolves to nothing.
+pub fn reference_target(
+    document: &Document,
+    parsed: &ParsedSql,
+    position: Position,
+    schema: &Schema,
+) -> Option<ReferenceTarget> {
+    let references = References::collect(&parsed.statements, schema);
+    let candidate = references
+        .candidates
+        .iter()
+        .find(|candidate| document.position_in_span(position, candidate.span))?;
+    let target = match references.resolve_candidate(candidate)? {
+        CandidateResolution::Table { table } => match table.origin {
+            TableOrigin::Query => ReferenceTarget::LocalTable {
+                name: table.name.clone(),
+                statement: candidate.statement,
+            },
+            _ => ReferenceTarget::Table {
+                name: table.name.clone(),
+            },
+        },
+        CandidateResolution::Column { table, column } => match table.origin {
+            TableOrigin::Query => ReferenceTarget::LocalColumn {
+                table: table.name.clone(),
+                column: column.name.clone(),
+                statement: candidate.statement,
+            },
+            _ => ReferenceTarget::Column {
+                table: table.name.clone(),
+                column: column.name.clone(),
+            },
+        },
+    };
+    Some(target)
+}
+
+/// The ranges in `document` whose identifiers resolve to `target`,
+/// in source order.
+///
+/// Aliases count: both an alias definition and qualifiers spelled through it
+/// resolve to the aliased relation. A query-local relation shadowing a
+/// schema table keeps its statement's references out of that table's
+/// results, and local targets match only inside their defining statement.
+pub fn references_to(
+    document: &Document,
+    parsed: &ParsedSql,
+    schema: &Schema,
+    target: &ReferenceTarget,
+) -> Vec<Range> {
+    let references = References::collect(&parsed.statements, schema);
+    let mut ranges = Vec::new();
+    for candidate in &references.candidates {
+        let Some(resolution) = references.resolve_candidate(candidate) else {
+            continue;
+        };
+        let matches = match (target, resolution) {
+            (ReferenceTarget::Table { name }, CandidateResolution::Table { table }) => {
+                table.origin != TableOrigin::Query && table.name.eq_ignore_ascii_case(name)
+            }
+            (
+                ReferenceTarget::Column {
+                    table: target_table,
+                    column: target_column,
+                },
+                CandidateResolution::Column { table, column },
+            ) => {
+                table.origin != TableOrigin::Query
+                    && table.name.eq_ignore_ascii_case(target_table)
+                    && column.name.eq_ignore_ascii_case(target_column)
+            }
+            (
+                ReferenceTarget::LocalTable { name, statement },
+                CandidateResolution::Table { table },
+            ) => {
+                table.origin == TableOrigin::Query
+                    && candidate.statement == *statement
+                    && table.name.eq_ignore_ascii_case(name)
+            }
+            (
+                ReferenceTarget::LocalColumn {
+                    table: target_table,
+                    column: target_column,
+                    statement,
+                },
+                CandidateResolution::Column { table, column },
+            ) => {
+                table.origin == TableOrigin::Query
+                    && candidate.statement == *statement
+                    && table.name.eq_ignore_ascii_case(target_table)
+                    && column.name.eq_ignore_ascii_case(target_column)
+            }
+            _ => false,
+        };
+        if matches && let Some(range) = document.range_of(candidate.span) {
+            ranges.push(range);
+        }
+    }
+    // Candidates are collected in visitor order, which is not source order.
+    ranges.sort_by_key(|range| (range.start.line, range.start.character));
+    ranges
+}
+
 /// Resolves the identifier at `position` in `document` to a schema object or
 /// a query-local relation.
 pub fn resolve_at(
@@ -619,5 +815,76 @@ mod tests {
         let sql = "SELECT id FROM users; SELECT id FROM posts;";
         assert_eq!(resolve(sql, 0, 7).as_deref(), Some("column:users.id"));
         assert_eq!(resolve(sql, 0, 29).as_deref(), Some("column:posts.id"));
+    }
+
+    fn target_at(sql: &str, character: u32) -> Option<ReferenceTarget> {
+        let document = Document::new(sql.to_owned());
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        reference_target(&document, &parsed, Position::new(0, character), &schema())
+    }
+
+    fn reference_starts(sql: &str, target: &ReferenceTarget) -> Vec<u32> {
+        let document = Document::new(sql.to_owned());
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        references_to(&document, &parsed, &schema(), target)
+            .into_iter()
+            .map(|range| range.start.character)
+            .collect()
+    }
+
+    #[test]
+    fn table_references_include_aliases_and_qualifiers() {
+        let sql = "SELECT u.email FROM users AS u";
+        let target = target_at(sql, 22).expect("resolves");
+        assert_eq!(
+            target,
+            ReferenceTarget::Table {
+                name: "users".to_owned()
+            }
+        );
+        // The table name, its alias definition, and the qualifier all count.
+        assert_eq!(reference_starts(sql, &target), vec![7, 20, 29]);
+    }
+
+    #[test]
+    fn column_references_match_across_statements() {
+        let sql = "SELECT email FROM users; UPDATE users SET email = ''";
+        let target = target_at(sql, 8).expect("resolves");
+        assert_eq!(
+            target,
+            ReferenceTarget::Column {
+                table: "users".to_owned(),
+                column: "email".to_owned()
+            }
+        );
+        assert_eq!(reference_starts(sql, &target), vec![7, 42]);
+    }
+
+    #[test]
+    fn local_relations_stay_inside_their_statement() {
+        let sql =
+            "WITH recent AS (SELECT id FROM posts) SELECT id FROM recent; SELECT id FROM recent";
+        let target = target_at(sql, 6).expect("resolves");
+        assert!(target.is_document_local(), "{target:?}");
+        // The definition and the first statement's FROM, but not the second
+        // statement's (unresolvable) `recent`.
+        assert_eq!(reference_starts(sql, &target), vec![5, 53]);
+    }
+
+    #[test]
+    fn shadowing_locals_do_not_count_as_schema_references() {
+        let sql = "WITH posts AS (SELECT id FROM users) SELECT id FROM posts; SELECT id FROM posts";
+        let target = ReferenceTarget::Table {
+            name: "posts".to_owned(),
+        };
+        // Only the second statement references the schema table; the first
+        // statement's `posts` is its CTE.
+        assert_eq!(reference_starts(sql, &target), vec![74]);
+    }
+
+    #[test]
+    fn unresolvable_positions_have_no_target() {
+        assert_eq!(target_at("SELECT nope FROM missing", 8), None);
+        assert_eq!(target_at("SELECT 1 + 2", 10), None);
     }
 }

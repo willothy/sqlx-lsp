@@ -414,6 +414,63 @@ fn diagnostics_flag_syntax_errors_and_unknown_references() {
 }
 
 #[test]
+fn references_span_open_documents_and_migrations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM users");
+    let other_uri = file_uri(&dir.path().join("r.sql"));
+    client.open(&other_uri, "DELETE FROM users");
+
+    let references = |client: &mut LspClient, include_declaration: bool| {
+        client
+            .request(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": query_uri },
+                    "position": { "line": 0, "character": 17 },
+                    "context": { "includeDeclaration": include_declaration },
+                }),
+            )
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Both open documents and the migration's CREATE TABLE are found.
+    let locations = references(&mut client, true);
+    let uris: Vec<&str> = locations
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert!(uris.contains(&query_uri.as_str()), "{locations:?}");
+    assert!(uris.contains(&other_uri.as_str()), "{locations:?}");
+    assert!(
+        uris.iter().any(|uri| uri.ends_with("1_users.sql")),
+        "{locations:?}"
+    );
+
+    // Without the declaration, the defining identifier drops out and the
+    // open documents remain.
+    let locations = references(&mut client, false);
+    assert!(
+        locations
+            .iter()
+            .filter_map(|location| location["uri"].as_str())
+            .all(|uri| !uri.ends_with("1_users.sql")),
+        "{locations:?}"
+    );
+    assert_eq!(locations.len(), 2, "{locations:?}");
+}
+
+#[test]
 fn reloads_report_work_done_progress() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut client = LspClient::start_with_capabilities(

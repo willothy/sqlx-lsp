@@ -96,6 +96,31 @@ impl Workspace {
             .unwrap_or(&self.fallback)
     }
 
+    /// The `.sql` files of every indexed migrations directory that serves
+    /// `context`: those under the context root which, for the fallback's
+    /// empty root, is all of them — matching how its schema merges every
+    /// folder. Directories that vanished since the last load are skipped;
+    /// the next reload drops them.
+    pub fn migration_files_for(&self, context: &DbContext) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for dir in &self.migration_dirs {
+            if !dir.starts_with(&context.root) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|extension| extension == "sql") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
     /// The deepest context whose root contains `path`, if any.
     fn deepest_containing<'a>(contexts: &'a [DbContext], path: &Path) -> Option<&'a DbContext> {
         contexts
@@ -560,7 +585,7 @@ fn migration_dirs_for(crate_root: &Path, config: &SqlxConfig, notes: &mut LoadLo
 /// Resolves symlinks in `path` so it compares against canonical context
 /// roots. Files that don't exist yet (unsaved buffers) resolve through
 /// their nearest existing ancestor.
-fn normalize(path: PathBuf) -> PathBuf {
+pub(crate) fn normalize(path: PathBuf) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(&path) {
         return canonical;
     }

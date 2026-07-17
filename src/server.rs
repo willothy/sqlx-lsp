@@ -8,27 +8,29 @@ use tower_lsp_server::ls_types::{
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, MessageType, OneOf, ProgressToken, Range, Registration,
-    SemanticToken, SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Unregistration, Uri, WorkDoneProgressOptions,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    InitializeResult, InitializedParams, Location, MessageType, OneOf, ProgressToken, Range,
+    ReferenceParams, Registration, SemanticToken, SemanticTokens, SemanticTokensDelta,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
+    SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Unregistration, Uri,
+    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::analysis::resolve::{self, ReferenceTarget};
 use crate::analysis::{completion, definition, diagnostics, hover, semantic_tokens};
 use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::embedded::{self, EmbeddedSql};
 use crate::parse::ParsedSql;
-use crate::workspace::Workspace;
+use crate::workspace::{self, DbContext, Workspace};
 
 /// How an open document is served: as a SQL file, or as a Rust file whose
 /// sqlx query macros embed SQL.
@@ -257,6 +259,70 @@ impl ServerState {
         }
     }
 
+    /// Extends `locations` with references to `target` found in every other
+    /// open document served by `context` and in the context's migration
+    /// files on disk. Migration files that are open are skipped — their
+    /// buffer contents were already searched.
+    fn collect_context_references(
+        &self,
+        workspace: &Workspace,
+        origin: &Uri,
+        context: &DbContext,
+        target: &ReferenceTarget,
+        locations: &mut Vec<Location>,
+    ) {
+        let mut open_paths = HashSet::new();
+        for entry in self.documents.iter() {
+            let entry_uri = entry.key();
+            if let Some(path) = entry_uri.to_file_path() {
+                open_paths.insert(workspace::normalize(path.into_owned()));
+            }
+            if entry_uri == origin || !std::ptr::eq(workspace.context_for(entry_uri), context) {
+                continue;
+            }
+            match entry.language {
+                DocumentLanguage::Sql => {
+                    let parsed = entry.parsed(context.kind);
+                    for range in
+                        resolve::references_to(&entry.document, &parsed, &context.schema, target)
+                    {
+                        locations.push(Location::new(entry_uri.clone(), range));
+                    }
+                }
+                DocumentLanguage::Rust => {
+                    let extracted = entry.extracted();
+                    for range in
+                        embedded::references_to(&extracted, &context.schema, context.kind, target)
+                    {
+                        locations.push(Location::new(entry_uri.clone(), range));
+                    }
+                }
+            }
+        }
+
+        for path in workspace.migration_files_for(context) {
+            if open_paths.contains(&workspace::normalize(path.clone())) {
+                continue;
+            }
+            // Absolutize the same way the schema records definition
+            // locations, so the resulting URIs compare equal to them.
+            let Ok(path) = std::path::absolute(&path) else {
+                continue;
+            };
+            let Some(file_uri) = Uri::from_file_path(&path) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let document = Document::new(text);
+            let parsed = ParsedSql::parse(context.kind.dialect(), document.text());
+            for range in resolve::references_to(&document, &parsed, &context.schema, target) {
+                locations.push(Location::new(file_uri.clone(), range));
+            }
+        }
+    }
+
     /// The full semantic-token stream for `open` under `kind`.
     fn compute_tokens(&self, open: &OpenDocument, kind: DatabaseKind) -> Vec<SemanticToken> {
         match open.language {
@@ -477,6 +543,7 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_owned()]),
                     ..CompletionOptions::default()
@@ -644,6 +711,100 @@ impl LanguageServer for Backend {
             }
         };
         Ok(location.map(GotoDefinitionResponse::Scalar))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let workspace = self.workspace.read().await;
+        let context = workspace.context_for(&uri);
+
+        // The target under the cursor and the requesting document's own
+        // matching ranges.
+        let (target, own_ranges) = {
+            let Some(open) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            match open.language {
+                DocumentLanguage::Sql => {
+                    let parsed = open.parsed(context.kind);
+                    let Some(target) = resolve::reference_target(
+                        &open.document,
+                        &parsed,
+                        position,
+                        &context.schema,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let ranges =
+                        resolve::references_to(&open.document, &parsed, &context.schema, &target);
+                    (target, ranges)
+                }
+                DocumentLanguage::Rust => {
+                    let extracted = open.extracted();
+                    let Some((target, ranges)) = embedded::references_at(
+                        &extracted,
+                        position,
+                        &context.schema,
+                        context.kind,
+                    ) else {
+                        return Ok(None);
+                    };
+                    (target, ranges)
+                }
+            }
+        };
+
+        let mut locations: Vec<Location> = own_ranges
+            .into_iter()
+            .map(|range| Location::new(uri.clone(), range))
+            .collect();
+
+        // A query-local relation exists only inside the requesting document;
+        // schema objects are searched across the context.
+        if !target.is_document_local() {
+            self.collect_context_references(&workspace, &uri, context, &target, &mut locations);
+        }
+
+        let declaration = match &target {
+            ReferenceTarget::Table { name } => context
+                .schema
+                .table(name)
+                .and_then(|table| table.location.clone()),
+            ReferenceTarget::Column { table, column } => {
+                context.schema.table(table).and_then(|table| {
+                    table
+                        .column(column)
+                        .and_then(|column| column.location.clone())
+                        .or_else(|| table.location.clone())
+                })
+            }
+            ReferenceTarget::LocalTable { .. } | ReferenceTarget::LocalColumn { .. } => None,
+        }
+        .map(Location::from);
+        if params.context.include_declaration {
+            if let Some(declaration) = declaration
+                && !locations.contains(&declaration)
+            {
+                locations.push(declaration);
+            }
+        } else if let Some(declaration) = declaration {
+            locations.retain(|location| *location != declaration);
+        }
+
+        locations.sort_by(|a, b| {
+            (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+                b.uri.as_str(),
+                b.range.start.line,
+                b.range.start.character,
+            ))
+        });
+        locations.dedup();
+
+        if locations.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(locations))
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
