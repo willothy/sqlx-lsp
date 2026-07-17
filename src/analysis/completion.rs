@@ -85,6 +85,9 @@ enum Context {
     TableName,
     /// Right after `<qualifier>.`: columns of the qualified relation.
     QualifiedColumn { qualifier: String },
+    /// Inside the column list of `INSERT INTO <table> (...)`: strictly that
+    /// table's columns.
+    InsertColumns { table: String },
     /// Anywhere else: columns in scope, relations, keywords, functions.
     General,
 }
@@ -177,7 +180,40 @@ impl<'a> Cursor<'a> {
             {
                 Context::TableName
             }
-            _ => Context::General,
+            _ => self
+                .insert_column_list(index)
+                .map(|table| Context::InsertColumns { table })
+                .unwrap_or(Context::General),
+        }
+    }
+
+    /// The target table when the token at `index` sits inside the column
+    /// list of `INSERT INTO <table> (...)`: the innermost unmatched opening
+    /// parenthesis at or before `index` directly follows the insert target.
+    /// A `VALUES (...)` or subquery parenthesis is someone else's context.
+    fn insert_column_list(&self, index: usize) -> Option<String> {
+        let mut depth = 0usize;
+        let open = (0..=index).rev().find(|&i| match self.tokens[i].0 {
+            Token::RParen => {
+                depth += 1;
+                false
+            }
+            Token::LParen => match depth {
+                0 => true,
+                _ => {
+                    depth -= 1;
+                    false
+                }
+            },
+            _ => false,
+        })?;
+        let table = match self.tokens.get(open.checked_sub(1)?) {
+            Some((Token::Word(word), _)) if word.keyword == Keyword::NoKeyword => &word.value,
+            _ => return None,
+        };
+        match self.tokens.get(open.checked_sub(2)?) {
+            Some((Token::Word(word), _)) if word.keyword == Keyword::INTO => Some(table.clone()),
+            _ => None,
         }
     }
 
@@ -378,6 +414,18 @@ pub fn completions(
                 );
             }
         }
+        Context::InsertColumns { table } => {
+            // Strictly the insert target's columns: nothing else is valid
+            // in an INSERT column list.
+            if let Some(table) = resolve_table(&table) {
+                items.extend(
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| column_item(table, column, '1', replace)),
+                );
+            }
+        }
         Context::General => {
             // Columns of in-scope relations first, then all relations,
             // keywords, and functions; clients filter by typed prefix.
@@ -462,6 +510,33 @@ mod tests {
         let labels = labels_at("INSERT INTO |");
         assert!(labels.contains(&"posts".to_owned()));
         assert!(!labels.contains(&"title".to_owned()));
+    }
+
+    #[test]
+    fn insert_column_lists_offer_only_the_target_columns() {
+        let labels = labels_at("INSERT INTO posts (|");
+        assert_eq!(
+            labels,
+            vec!["id".to_owned(), "author_id".to_owned(), "title".to_owned()]
+        );
+
+        // Later in the list, and mid-word, the context holds.
+        let labels = labels_at("INSERT INTO posts (author_id, t|");
+        assert_eq!(
+            labels,
+            vec!["id".to_owned(), "author_id".to_owned(), "title".to_owned()]
+        );
+    }
+
+    #[test]
+    fn insert_values_parens_are_not_a_column_list() {
+        let labels = labels_at("INSERT INTO posts (author_id) VALUES (|");
+        assert!(labels.contains(&"SELECT".to_owned()));
+    }
+
+    #[test]
+    fn unknown_insert_targets_offer_nothing() {
+        assert!(labels_at("INSERT INTO nope (|").is_empty());
     }
 
     #[test]
