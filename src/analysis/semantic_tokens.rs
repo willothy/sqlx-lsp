@@ -18,7 +18,9 @@ use sqlparser::ast::{
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Span, Token, Whitespace};
-use tower_lsp_server::ls_types::{SemanticToken, SemanticTokenType, SemanticTokensLegend};
+use tower_lsp_server::ls_types::{
+    SemanticToken, SemanticTokenType, SemanticTokensEdit, SemanticTokensLegend,
+};
 
 use crate::document::Document;
 use crate::parse::ParsedSql;
@@ -397,6 +399,29 @@ pub fn encode(mut segments: Vec<TokenSegment>) -> Vec<SemanticToken> {
 
 /// Computes the full semantic token stream for `document`, delta-encoded as
 /// the LSP wire format requires.
+/// The single edit that turns `previous` into `current`, expressed in the
+/// flat-integer positions the semantic-tokens delta protocol uses (five
+/// integers per token). Identical streams yield an empty edit.
+pub fn token_edit(previous: &[SemanticToken], current: &[SemanticToken]) -> SemanticTokensEdit {
+    let common_prefix = previous
+        .iter()
+        .zip(current.iter())
+        .take_while(|(old, new)| old == new)
+        .count();
+    let common_suffix = previous[common_prefix..]
+        .iter()
+        .rev()
+        .zip(current[common_prefix..].iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+
+    SemanticTokensEdit {
+        start: (common_prefix * 5) as u32,
+        delete_count: ((previous.len() - common_prefix - common_suffix) * 5) as u32,
+        data: Some(current[common_prefix..current.len() - common_suffix].to_vec()),
+    }
+}
+
 pub fn semantic_tokens(document: &Document, parsed: &ParsedSql) -> Vec<SemanticToken> {
     encode(segments(document, parsed))
 }
@@ -519,5 +544,41 @@ mod tests {
         assert!(tokens.contains(&(0, 0, 6, keyword)));
         assert!(tokens.contains(&(0, 18, 5, TokenClass::StringLiteral as u32)));
         assert!(tokens.contains(&(0, 24, 2, TokenClass::Number as u32)));
+    }
+
+    fn raw_tokens(sql: &str) -> Vec<SemanticToken> {
+        let document = Document::new(sql.to_owned());
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        semantic_tokens(&document, &parsed)
+    }
+
+    #[test]
+    fn token_edits_cover_identical_appended_and_changed_streams() {
+        let before = raw_tokens("SELECT id FROM users");
+
+        // Identical streams produce an empty edit.
+        let edit = token_edit(&before, &before);
+        assert_eq!(edit.delete_count, 0);
+        assert_eq!(edit.data.as_deref(), Some(&[][..]));
+
+        // Appending only adds data at the tail.
+        let appended = raw_tokens("SELECT id FROM users WHERE id = 1");
+        let edit = token_edit(&before, &appended);
+        assert_eq!(edit.start, (before.len() * 5) as u32);
+        assert_eq!(edit.delete_count, 0);
+        assert_eq!(
+            edit.data.as_deref().map(<[SemanticToken]>::len),
+            Some(appended.len() - before.len())
+        );
+
+        // A middle change keeps the shared prefix and suffix out of the
+        // edit; applying it must reproduce the new stream.
+        let changed = raw_tokens("SELECT name FROM users");
+        let edit = token_edit(&before, &changed);
+        let mut patched = before.clone();
+        let start = (edit.start / 5) as usize;
+        let end = start + (edit.delete_count / 5) as usize;
+        patched.splice(start..end, edit.data.clone().unwrap_or_default());
+        assert_eq!(patched, changed);
     }
 }

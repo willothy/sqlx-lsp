@@ -317,6 +317,87 @@ fn exits_cleanly_on_the_exit_notification() {
 }
 
 #[test]
+fn semantic_token_deltas_and_ranges_follow_edits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM users");
+
+    let full = client.request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": query_uri } }),
+    );
+    let result_id = full["resultId"].as_str().expect("result id").to_owned();
+    let mut data: Vec<u64> = full["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    assert!(!data.is_empty());
+
+    // Edit the document; the delta relative to the previous result id must
+    // patch the old stream into the new one.
+    client.change(&query_uri, 2, "SELECT id FROM users WHERE id = 1");
+    let delta = client.request(
+        "textDocument/semanticTokens/full/delta",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "previousResultId": result_id,
+        }),
+    );
+    let edits = delta["edits"].as_array().expect("delta edits");
+    for edit in edits {
+        let start = edit["start"].as_u64().expect("start") as usize;
+        let delete_count = edit["deleteCount"].as_u64().expect("deleteCount") as usize;
+        let inserted: Vec<u64> = edit["data"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .collect()
+            })
+            .unwrap_or_default();
+        data.splice(start..start + delete_count, inserted);
+    }
+
+    let fresh = client.request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": query_uri } }),
+    );
+    let fresh_data: Vec<u64> = fresh["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    assert_eq!(data, fresh_data);
+
+    // A range request returns only the tokens inside the range.
+    let ranged = client.request(
+        "textDocument/semanticTokens/range",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "range": {
+                "start": { "line": 0, "character": 21 },
+                "end": { "line": 0, "character": 26 },
+            },
+        }),
+    );
+    let ranged_len = ranged["data"].as_array().expect("data").len();
+    assert!(ranged_len > 0, "range request returned no tokens");
+    assert!(ranged_len < fresh_data.len(), "range did not filter");
+}
+
+#[test]
 fn workspace_folder_changes_rebuild_contexts_mid_session() {
     let dir_a = tempfile::tempdir().expect("tempdir");
     let dir_b = tempfile::tempdir().expect("tempdir");

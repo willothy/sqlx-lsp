@@ -8,8 +8,10 @@ use tower_lsp_server::ls_types::{
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, MessageType, OneOf, Registration, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    InitializeResult, InitializedParams, MessageType, OneOf, Registration, SemanticToken,
+    SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Unregistration,
     Uri, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
@@ -17,7 +19,7 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::analysis::{completion, definition, hover, semantic_tokens};
@@ -61,6 +63,9 @@ struct OpenDocument {
     parsed_sql: Mutex<Option<(DatabaseKind, Arc<ParsedSql>)>>,
     /// The extracted query regions of the current text (Rust documents).
     extracted: Mutex<Option<Arc<EmbeddedSql>>>,
+    /// The most recently issued semantic-token stream and its result id,
+    /// kept across edits so delta requests can diff against it.
+    last_tokens: Mutex<Option<(String, Vec<SemanticToken>)>>,
 }
 
 impl OpenDocument {
@@ -70,6 +75,7 @@ impl OpenDocument {
             language,
             parsed_sql: Mutex::new(None),
             extracted: Mutex::new(None),
+            last_tokens: Mutex::new(None),
         }
     }
 
@@ -139,6 +145,9 @@ pub struct ServerState {
     /// Wakes the reload worker. Requests coalesce: any number of triggers
     /// while a reload runs result in exactly one follow-up reload.
     reload_notify: Notify,
+    /// Issues result ids for semantic-token streams; ids only need to be
+    /// unique per session.
+    next_tokens_id: AtomicU64,
 }
 
 impl Backend {
@@ -150,6 +159,7 @@ impl Backend {
             workspace: RwLock::new(Workspace::default()),
             watchers_unavailable: AtomicBool::new(false),
             reload_notify: Notify::new(),
+            next_tokens_id: AtomicU64::new(0),
         });
 
         // Reloads run here rather than in notification handlers: a slow
@@ -171,6 +181,32 @@ impl ServerState {
     /// Schedules a workspace reload on the worker and returns immediately.
     fn request_reload(&self) {
         self.reload_notify.notify_one();
+    }
+
+    /// The full semantic-token stream for `open` under `kind`.
+    fn compute_tokens(&self, open: &OpenDocument, kind: DatabaseKind) -> Vec<SemanticToken> {
+        match open.language {
+            DocumentLanguage::Sql => {
+                let parsed = open.parsed(kind);
+                semantic_tokens::semantic_tokens(&open.document, &parsed)
+            }
+            DocumentLanguage::Rust => {
+                let extracted = open.extracted();
+                embedded::embedded_semantic_tokens(&extracted, kind)
+            }
+        }
+    }
+
+    /// Stores `data` as the document's latest issued token stream and
+    /// returns the result id future delta requests will reference.
+    fn remember_tokens(&self, open: &OpenDocument, data: Vec<SemanticToken>) -> String {
+        let result_id = self
+            .next_tokens_id
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        *open.last_tokens.lock().expect("token cache lock poisoned") =
+            Some((result_id.clone(), data));
+        result_id
     }
 
     /// Rebuilds workspace state, forwards the resulting log lines to the
@@ -337,8 +373,8 @@ impl LanguageServer for Backend {
                         SemanticTokensOptions {
                             work_done_progress_options: WorkDoneProgressOptions::default(),
                             legend: semantic_tokens::legend(),
-                            range: None,
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: Some(true),
+                            full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                         },
                     ),
                 ),
@@ -520,19 +556,90 @@ impl LanguageServer for Backend {
             .await
             .context_for(&params.text_document.uri)
             .kind;
-        let data = match open.language {
+        let data = self.compute_tokens(&open, kind);
+        let result_id = self.remember_tokens(&open, data.clone());
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: Some(result_id),
+            data,
+        })))
+    }
+
+    async fn semantic_tokens_full_delta(
+        &self,
+        params: SemanticTokensDeltaParams,
+    ) -> jsonrpc::Result<Option<SemanticTokensFullDeltaResult>> {
+        let Some(open) = self.documents.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let kind = self
+            .workspace
+            .read()
+            .await
+            .context_for(&params.text_document.uri)
+            .kind;
+        let data = self.compute_tokens(&open, kind);
+
+        let previous = open
+            .last_tokens
+            .lock()
+            .expect("token cache lock poisoned")
+            .take()
+            .filter(|(id, _)| *id == params.previous_result_id);
+        let Some((_, previous_data)) = previous else {
+            // Unknown or stale baseline: fall back to a full stream.
+            let result_id = self.remember_tokens(&open, data.clone());
+            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
+                SemanticTokens {
+                    result_id: Some(result_id),
+                    data,
+                },
+            )));
+        };
+
+        let edit = semantic_tokens::token_edit(&previous_data, &data);
+        let result_id = self.remember_tokens(&open, data);
+        Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+            SemanticTokensDelta {
+                result_id: Some(result_id),
+                edits: vec![edit],
+            },
+        )))
+    }
+
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> jsonrpc::Result<Option<SemanticTokensRangeResult>> {
+        let Some(open) = self.documents.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let kind = self
+            .workspace
+            .read()
+            .await
+            .context_for(&params.text_document.uri)
+            .kind;
+        let mut segments = match open.language {
             DocumentLanguage::Sql => {
                 let parsed = open.parsed(kind);
-                semantic_tokens::semantic_tokens(&open.document, &parsed)
+                semantic_tokens::segments(&open.document, &parsed)
             }
             DocumentLanguage::Rust => {
                 let extracted = open.extracted();
-                embedded::embedded_semantic_tokens(&extracted, kind)
+                embedded::embedded_token_segments(&extracted, kind)
             }
         };
-        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+        let range = params.range;
+        segments.retain(|segment| {
+            (segment.line > range.start.line
+                || (segment.line == range.start.line
+                    && segment.start + segment.length > range.start.character))
+                && (segment.line < range.end.line
+                    || (segment.line == range.end.line && segment.start < range.end.character))
+        });
+        Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
             result_id: None,
-            data,
+            data: semantic_tokens::encode(segments),
         })))
     }
 

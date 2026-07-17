@@ -318,6 +318,16 @@ pub fn definition(
 /// coordinates and merged into one delta-encoded stream. The surrounding
 /// Rust code is untouched — its highlighting belongs to rust-analyzer.
 pub fn embedded_semantic_tokens(embedded: &EmbeddedSql, kind: DatabaseKind) -> Vec<SemanticToken> {
+    semantic_tokens::encode(embedded_token_segments(embedded, kind))
+}
+
+/// The classified token segments of every SQL region, shifted to host
+/// coordinates but not yet delta-encoded, so callers can filter (range
+/// requests) before encoding.
+pub fn embedded_token_segments(
+    embedded: &EmbeddedSql,
+    kind: DatabaseKind,
+) -> Vec<semantic_tokens::TokenSegment> {
     let mut all = Vec::new();
     for region in &embedded.regions {
         let sql_document = Document::new(region.text.clone());
@@ -330,7 +340,7 @@ pub fn embedded_semantic_tokens(embedded: &EmbeddedSql, kind: DatabaseKind) -> V
             all.push(segment);
         }
     }
-    semantic_tokens::encode(all)
+    all
 }
 
 #[cfg(test)]
