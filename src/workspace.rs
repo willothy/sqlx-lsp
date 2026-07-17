@@ -4,10 +4,11 @@
 //! `sqlx.toml`, its environment (URL variable and ancestor `.env` files),
 //! and its migrations all resolve relative to `CARGO_MANIFEST_DIR`. The
 //! workspace therefore holds one database context per sqlx-dependent member
-//! crate, and every document is served by the context of the crate that
-//! contains it. Documents outside any such crate fall back to a
-//! workspace-wide context whose schema merges every context, so shared SQL
-//! still resolves.
+//! crate, across every workspace folder, and every document is served by
+//! the context of the crate that contains it. Documents outside any crate
+//! are served by their folder's context (root-level configuration plus the
+//! folder's crates merged); documents outside every folder fall back to a
+//! workspace-wide merged view.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -37,17 +38,21 @@ pub struct DbContext {
 }
 
 /// Workspace-level state derived from configuration and schema sources on
-/// disk. Rebuilt whenever migrations, manifests, `sqlx.toml`, or `.env`
-/// change.
+/// disk. Rebuilt whenever migrations, manifests, `sqlx.toml`, `.env`, or the
+/// set of workspace folders change.
 #[derive(Debug)]
 pub struct Workspace {
-    /// The workspace root, when the client provided one.
-    pub root: Option<PathBuf>,
-    /// One context per sqlx-dependent member crate.
+    /// The workspace folder roots the client provided, in the order given.
+    pub roots: Vec<PathBuf>,
+    /// One context per sqlx-dependent member crate, across every folder.
     pub contexts: Vec<DbContext>,
-    /// Serves documents that belong to no context crate. Its schema merges
-    /// every context (later crates win name collisions), so shared SQL
-    /// outside any crate still resolves.
+    /// One context per workspace folder: its root-level configuration and
+    /// migrations, with every member context of that folder merged in
+    /// (later crates win name collisions). Serves the folder's documents
+    /// that belong to no member crate.
+    pub folder_contexts: Vec<DbContext>,
+    /// Serves documents outside every folder. Its schema merges every
+    /// folder context, so detached SQL still resolves best-effort.
     pub fallback: DbContext,
     /// Every migrations directory the schema indexes were built from, for
     /// save-triggered reloads.
@@ -57,8 +62,9 @@ pub struct Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Workspace {
-            root: None,
+            roots: Vec::new(),
             contexts: Vec::new(),
+            folder_contexts: Vec::new(),
             fallback: DbContext {
                 root: PathBuf::new(),
                 // SQL parsing needs *a* dialect even before (or without)
@@ -83,19 +89,88 @@ impl Workspace {
         // URIs may spell the same file through symlinks (`/var` vs
         // `/private/var` on macOS).
         let path = normalize(path.into_owned());
-        self.contexts
-            .iter()
-            .filter(|context| path.starts_with(&context.root))
-            .max_by_key(|context| context.root.components().count())
+        // Member crates take precedence over their folder, which takes
+        // precedence over the workspace-wide fallback.
+        Self::deepest_containing(&self.contexts, &path)
+            .or_else(|| Self::deepest_containing(&self.folder_contexts, &path))
             .unwrap_or(&self.fallback)
     }
 
-    /// Rebuilds the workspace state for `root`: re-detects the sqlx member
-    /// crates and builds a database context for each. Failures degrade per
-    /// component and are reported in the returned log lines.
-    pub async fn load(root: PathBuf) -> (Workspace, LoadLog) {
-        let mut log = Vec::new();
+    /// The deepest context whose root contains `path`, if any.
+    fn deepest_containing<'a>(contexts: &'a [DbContext], path: &Path) -> Option<&'a DbContext> {
+        contexts
+            .iter()
+            .filter(|context| path.starts_with(&context.root))
+            .max_by_key(|context| context.root.components().count())
+    }
 
+    /// Rebuilds the workspace state for `roots` (the client's workspace
+    /// folders): re-detects the sqlx member crates of every folder and
+    /// builds a database context for each crate and each folder. Failures
+    /// degrade per component and are reported in the returned log lines.
+    pub async fn load(roots: Vec<PathBuf>) -> (Workspace, LoadLog) {
+        let mut log = Vec::new();
+        let mut contexts = Vec::new();
+        let mut folder_contexts = Vec::new();
+        let mut migration_dirs = Vec::new();
+
+        for root in &roots {
+            // Folder roots must compare against normalized request paths in
+            // `context_for`, so resolve symlinks the same way here.
+            let (members, folder, dirs) =
+                Self::load_folder(normalize(root.clone()), &mut log).await;
+            contexts.extend(members);
+            folder_contexts.push(folder);
+            migration_dirs.extend(dirs);
+        }
+
+        // The fallback serves documents outside every folder; merging the
+        // folder views gives detached SQL a best-effort schema.
+        let mut fallback_schema = Schema::default();
+        for folder in &folder_contexts {
+            for table in folder.schema.tables() {
+                fallback_schema.insert_table(table.clone());
+            }
+        }
+        let fallback_kind = folder_contexts
+            .first()
+            .map(|folder| folder.kind)
+            .unwrap_or(DatabaseKind::Sqlite);
+
+        log.push((
+            MessageType::INFO,
+            format!(
+                "{} context(s) across {} folder(s); workspace-wide index holds {} relation(s)",
+                contexts.len(),
+                folder_contexts.len(),
+                fallback_schema.tables().count()
+            ),
+        ));
+
+        (
+            Workspace {
+                roots,
+                contexts,
+                folder_contexts,
+                fallback: DbContext {
+                    root: PathBuf::new(),
+                    kind: fallback_kind,
+                    schema: fallback_schema,
+                },
+                migration_dirs,
+            },
+            log,
+        )
+    }
+
+    /// Builds the contexts of one workspace folder: one per sqlx member
+    /// crate, plus the folder context serving everything else under it.
+    /// Returns the member contexts, the folder context, and the migration
+    /// directories loaded.
+    async fn load_folder(
+        root: PathBuf,
+        log: &mut LoadLog,
+    ) -> (Vec<DbContext>, DbContext, Vec<PathBuf>) {
         let detection_root = root.clone();
         let detection =
             tokio::task::spawn_blocking(move || Detection::detect(&detection_root)).await;
@@ -130,13 +205,12 @@ impl Workspace {
         let mut contexts = Vec::new();
         let mut migration_dirs = Vec::new();
         for member in sqlx_members {
-            let (context, dirs) =
-                DbContext::load(member, global_kind, enabled.clone(), &mut log).await;
+            let (context, dirs) = DbContext::load(member, global_kind, enabled.clone(), log).await;
             migration_dirs.extend(dirs);
             contexts.push(context);
         }
 
-        // The fallback context: root-level configuration and environment,
+        // The folder context: root-level configuration and environment,
         // with every member context's schema merged in.
         let fallback_root = root.clone();
         let fallback_enabled = enabled.clone();
@@ -174,8 +248,7 @@ impl Workspace {
         })
         .await;
 
-        let (fallback_env, fallback_kind, mut fallback_schema, fallback_dir, notes) = match fallback
-        {
+        let (folder_env, folder_kind, mut folder_schema, folder_dir, notes) = match fallback {
             Ok(parts) => parts,
             Err(join_error) => {
                 log.push((
@@ -192,49 +265,46 @@ impl Workspace {
             }
         };
         log.extend(notes);
-        if let Some(dir) = fallback_dir
+        if let Some(dir) = folder_dir
             && !migration_dirs.contains(&dir)
         {
             migration_dirs.push(dir);
         }
 
-        // Only introspect at the workspace level when no member context
-        // exists (a plain directory of SQL, or detection failed); contexts
+        // Only introspect at the folder level when no member context exists
+        // (a plain directory of SQL, or detection failed); contexts
         // otherwise carry their own introspected schemas into the merge.
         if contexts.is_empty()
-            && !fallback_env.offline
-            && let Some(url) = &fallback_env.database_url
+            && !folder_env.offline
+            && let Some(url) = &folder_env.database_url
         {
-            introspect_into(&mut fallback_schema, url, fallback_kind, &root, &mut log).await;
+            introspect_into(&mut folder_schema, url, folder_kind, &root, log).await;
         }
 
         for context in &contexts {
             for table in context.schema.tables() {
-                fallback_schema.insert_table(table.clone());
+                folder_schema.insert_table(table.clone());
             }
         }
 
         log.push((
             MessageType::INFO,
             format!(
-                "{} context(s); workspace-wide index holds {} relation(s)",
+                "folder {}: {} member context(s), {} relation(s)",
+                root.display(),
                 contexts.len(),
-                fallback_schema.tables().count()
+                folder_schema.tables().count()
             ),
         ));
 
         (
-            Workspace {
-                root: Some(root.clone()),
-                contexts,
-                fallback: DbContext {
-                    root,
-                    kind: fallback_kind,
-                    schema: fallback_schema,
-                },
-                migration_dirs,
+            contexts,
+            DbContext {
+                root,
+                kind: folder_kind,
+                schema: folder_schema,
             },
-            log,
+            migration_dirs,
         )
     }
 }
@@ -501,13 +571,14 @@ mod tests {
     #[test]
     fn context_routing_picks_the_deepest_containing_crate() {
         let workspace = Workspace {
-            root: Some(PathBuf::from("/repo")),
+            roots: vec![PathBuf::from("/repo")],
             contexts: vec![
                 context(Path::new("/repo/services"), DatabaseKind::MySql),
                 context(Path::new("/repo/services/api"), DatabaseKind::Postgres),
                 context(Path::new("/repo/tools"), DatabaseKind::Sqlite),
             ],
-            fallback: context(Path::new("/repo"), DatabaseKind::Sqlite),
+            folder_contexts: vec![context(Path::new("/repo"), DatabaseKind::MySql)],
+            fallback: context(Path::new(""), DatabaseKind::Sqlite),
             migration_dirs: Vec::new(),
         };
         let uri = |path: &str| Uri::from_file_path(path).expect("valid path");
@@ -516,8 +587,49 @@ mod tests {
         assert_eq!(api.kind, DatabaseKind::Postgres);
         let services = workspace.context_for(&uri("/repo/services/worker/src/main.rs"));
         assert_eq!(services.kind, DatabaseKind::MySql);
+        // Inside the folder but outside every member crate: the folder
+        // context serves it.
         let shared = workspace.context_for(&uri("/repo/docs/example.sql"));
-        assert!(std::ptr::eq(shared, &workspace.fallback));
+        assert!(std::ptr::eq(shared, &workspace.folder_contexts[0]));
+        // Outside every folder: the workspace-wide fallback.
+        let detached = workspace.context_for(&uri("/elsewhere/example.sql"));
+        assert!(std::ptr::eq(detached, &workspace.fallback));
+    }
+
+    /// Two unrelated folders in one workspace: each gets its own folder
+    /// context and schema, and only detached documents see the merged view.
+    #[tokio::test]
+    async fn multiple_workspace_folders_get_isolated_contexts() {
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir_a.path().join("migrations")).expect("mkdir");
+        std::fs::create_dir_all(dir_b.path().join("migrations")).expect("mkdir");
+        std::fs::write(
+            dir_a.path().join("migrations").join("1_users.sql"),
+            "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+        )
+        .expect("write migration");
+        std::fs::write(
+            dir_b.path().join("migrations").join("1_posts.sql"),
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY);",
+        )
+        .expect("write migration");
+
+        let (workspace, _log) =
+            Workspace::load(vec![dir_a.path().to_owned(), dir_b.path().to_owned()]).await;
+        assert_eq!(workspace.folder_contexts.len(), 2);
+
+        let uri = |path: PathBuf| Uri::from_file_path(path).expect("valid path");
+        let in_a = workspace.context_for(&uri(dir_a.path().join("q.sql")));
+        assert!(in_a.schema.table("users").is_some());
+        assert!(in_a.schema.table("posts").is_none());
+
+        let in_b = workspace.context_for(&uri(dir_b.path().join("q.sql")));
+        assert!(in_b.schema.table("posts").is_some());
+        assert!(in_b.schema.table("users").is_none());
+
+        assert!(workspace.fallback.schema.table("users").is_some());
+        assert!(workspace.fallback.schema.table("posts").is_some());
     }
 
     #[test]
@@ -646,7 +758,7 @@ mod tests {
         .expect("write migration");
         std::fs::write(lite.join(".env"), "DATABASE_URL=sqlite://cache.db\n").expect("write .env");
 
-        let (workspace, log) = Workspace::load(root.to_owned()).await;
+        let (workspace, log) = Workspace::load(vec![root.to_owned()]).await;
         let dump = || {
             log.iter()
                 .map(|(_, line)| line.as_str())

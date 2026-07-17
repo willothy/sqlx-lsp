@@ -16,6 +16,7 @@ use tower_lsp_server::ls_types::{
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -136,18 +137,18 @@ impl Backend {
     /// client, and refreshes the file watchers to cover the migration
     /// directories the new state actually consumes.
     async fn reload_workspace(&self) {
-        let root = self.workspace.read().await.root.clone();
-        let Some(root) = root else {
+        let roots = self.workspace.read().await.roots.clone();
+        if roots.is_empty() {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    "no workspace root; schema features are unavailable",
+                    "no workspace folders; schema features are unavailable",
                 )
                 .await;
             return;
-        };
+        }
 
-        let (workspace, log) = Workspace::load(root).await;
+        let (workspace, log) = Workspace::load(roots).await;
         *self.workspace.write().await = workspace;
         for (message_type, message) in log {
             self.client.log_message(message_type, message).await;
@@ -242,17 +243,25 @@ impl Backend {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for folder in params.workspace_folders.as_deref().unwrap_or_default() {
+            if let Some(path) = folder.uri.to_file_path() {
+                let path = path.into_owned();
+                if !roots.contains(&path) {
+                    roots.push(path);
+                }
+            }
+        }
         // `root_uri` is deprecated in the protocol but still the only root
         // older clients send; keep it as the fallback.
         #[allow(deprecated)]
-        let root = params
-            .workspace_folders
-            .as_ref()
-            .and_then(|folders| folders.first())
-            .map(|folder| folder.uri.clone())
-            .or(params.root_uri)
-            .and_then(|uri| uri.to_file_path().map(|path| path.into_owned()));
-        self.workspace.write().await.root = root;
+        if roots.is_empty()
+            && let Some(uri) = &params.root_uri
+            && let Some(path) = uri.to_file_path()
+        {
+            roots.push(path.into_owned());
+        }
+        self.workspace.write().await.roots = roots;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
