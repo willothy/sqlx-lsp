@@ -10,7 +10,7 @@
 //! by the SQL parser as a backslash and an `n`.
 
 use tower_lsp_server::ls_types::{
-    CompletionItem, Diagnostic, Hover, Location, Position, Range, SemanticToken,
+    CompletionItem, CompletionTextEdit, Diagnostic, Hover, Location, Position, Range, SemanticToken,
 };
 use tree_sitter::{Node, Parser};
 
@@ -289,7 +289,8 @@ fn string_literal_text(literal: Node<'_>, source: &str) -> Option<String> {
 }
 
 /// Completion items for the SQL region at `position`, if the position is
-/// inside one.
+/// inside one, with their accept edits mapped back to host-document
+/// coordinates.
 pub fn completions(
     embedded: &EmbeddedSql,
     position: Position,
@@ -301,13 +302,19 @@ pub fn completions(
     };
     let sql_document = Document::new(region.text.clone());
     let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
-    crate::analysis::completion::completions(
+    let mut items = crate::analysis::completion::completions(
         &sql_document,
         &parsed,
         region.to_embedded(position),
         schema,
         kind,
-    )
+    );
+    for item in &mut items {
+        if let Some(CompletionTextEdit::Edit(edit)) = &mut item.text_edit {
+            edit.range = region.to_host_range(edit.range);
+        }
+    }
+    items
 }
 
 /// Hover for the SQL region at `position`, with its highlight range mapped

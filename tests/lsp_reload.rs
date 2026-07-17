@@ -484,9 +484,26 @@ fn rust_buffers_serve_sql_inside_query_macros() {
     let hover = client.hover_text(&main_uri, 1, 43);
     assert!(hover.contains("CREATE TABLE users"), "{hover}");
 
-    // Completion after `FROM ` offers the schema's tables.
+    // Completion after `FROM ` offers the schema's tables, with accept
+    // edits in host coordinates.
     let labels = client.completion_labels(&main_uri, 1, 41);
     assert!(labels.contains(&"users".to_owned()), "{labels:?}");
+    let items = client.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 1, "character": 41 },
+        }),
+    );
+    let users = items
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["label"] == "users"))
+        .expect("users offered");
+    assert_eq!(users["textEdit"]["range"]["start"]["line"], 1, "{users:?}");
+    assert_eq!(
+        users["textEdit"]["range"]["start"]["character"], 41,
+        "{users:?}"
+    );
 
     // Goto definition escapes the Rust buffer into the migration file.
     let location = client.request(
