@@ -62,13 +62,13 @@ pub struct Workspace {
     pub migration_dirs: Vec<PathBuf>,
     /// Every migration file's contents, read once at load time so reference
     /// searches need no request-time disk access. Reloads rebuild the list.
-    pub migration_documents: Vec<MigrationDocument>,
+    pub migration_documents: Vec<SqlDocument>,
 }
 
-/// One migration file, read and cached when the workspace loads.
+/// One `.sql` file, read and cached when the workspace loads.
 #[derive(Debug)]
-pub struct MigrationDocument {
-    /// Absolute path of the file, as scanned from its migrations directory.
+pub struct SqlDocument {
+    /// Absolute path of the file, as scanned from its directory.
     pub path: PathBuf,
     /// The path as a file URI.
     pub uri: Uri,
@@ -80,7 +80,7 @@ pub struct MigrationDocument {
     parsed: Mutex<Option<(DatabaseKind, Arc<ParsedSql>)>>,
 }
 
-impl MigrationDocument {
+impl SqlDocument {
     /// The parse of the contents under `kind`'s dialect, computed at most
     /// once per dialect for the lifetime of this workspace load.
     pub fn parsed(&self, kind: DatabaseKind) -> Arc<ParsedSql> {
@@ -98,7 +98,7 @@ impl MigrationDocument {
     /// Reads every `.sql` file under `dirs`, down-migrations included —
     /// they reference schema objects too. Unreadable files are skipped;
     /// the next reload retries them.
-    fn scan(dirs: &[PathBuf]) -> Vec<MigrationDocument> {
+    fn scan(dirs: &[PathBuf]) -> Vec<SqlDocument> {
         let mut documents = Vec::new();
         for dir in dirs {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -118,7 +118,7 @@ impl MigrationDocument {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                documents.push(MigrationDocument {
+                documents.push(SqlDocument {
                     path,
                     uri,
                     document: Document::new(text),
@@ -231,7 +231,7 @@ impl Workspace {
                     kind: fallback_kind,
                     schema: fallback_schema,
                 },
-                migration_documents: MigrationDocument::scan(&migration_dirs),
+                migration_documents: SqlDocument::scan(&migration_dirs),
                 migration_dirs,
             },
             log,
