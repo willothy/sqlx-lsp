@@ -185,12 +185,13 @@ impl LiveDatabase {
         }
     }
 
-    /// Reads every relation (with columns) from the database.
-    pub async fn introspect(&self) -> Result<Vec<Table>, IntrospectError> {
+    /// Reads every relation (with columns) from the database, except the
+    /// `migrations_table` sqlx uses for bookkeeping.
+    pub async fn introspect(&self, migrations_table: &str) -> Result<Vec<Table>, IntrospectError> {
         match self {
-            LiveDatabase::Sqlite(database) => database.introspect().await,
-            LiveDatabase::Postgres(database) => database.introspect().await,
-            LiveDatabase::MySql(database) => database.introspect().await,
+            LiveDatabase::Sqlite(database) => database.introspect(migrations_table).await,
+            LiveDatabase::Postgres(database) => database.introspect(migrations_table).await,
+            LiveDatabase::MySql(database) => database.introspect(migrations_table).await,
         }
     }
 }

@@ -50,8 +50,9 @@ impl PostgresDatabase {
     }
 
     /// Reads every table, view, and materialized view visible on the
-    /// connection's search path, with columns, from the system catalogs.
-    pub async fn introspect(&self) -> Result<Vec<Table>, IntrospectError> {
+    /// connection's search path, with columns, from the system catalogs —
+    /// except the `migrations_table` sqlx uses for bookkeeping.
+    pub async fn introspect(&self, migrations_table: &str) -> Result<Vec<Table>, IntrospectError> {
         let query_error = |source| IntrospectError::Query {
             backend: DatabaseKind::Postgres,
             target: self.display_url.clone(),
@@ -66,10 +67,11 @@ impl PostgresDatabase {
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('r', 'p', 'v', 'm') \
                AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
-               AND c.relname != '_sqlx_migrations' \
+               AND c.relname != $1 \
                AND pg_catalog.pg_table_is_visible(c.oid) \
              ORDER BY c.relname",
         )
+        .bind(migrations_table)
         .fetch_all(&mut connection)
         .await
         .map_err(query_error)?;

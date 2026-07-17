@@ -50,11 +50,12 @@ impl SqliteDatabase {
         &self.path
     }
 
-    /// Reads every table and view (with columns) from the database.
+    /// Reads every table and view (with columns) from the database, except
+    /// the `migrations_table` sqlx uses for bookkeeping.
     ///
     /// The connection is read-only, so introspection can never mutate or
     /// create the user's database.
-    pub async fn introspect(&self) -> Result<Vec<Table>, IntrospectError> {
+    pub async fn introspect(&self, migrations_table: &str) -> Result<Vec<Table>, IntrospectError> {
         if !self.path.is_file() {
             return Err(IntrospectError::DatabaseMissing {
                 path: self.path.clone(),
@@ -76,9 +77,10 @@ impl SqliteDatabase {
         let relations = sqlx::query(
             "SELECT name, type FROM sqlite_master \
              WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' \
-               AND name != '_sqlx_migrations' \
+               AND name != ? \
              ORDER BY name",
         )
+        .bind(migrations_table)
         .fetch_all(&mut connection)
         .await
         .map_err(query_error)?;
@@ -184,7 +186,10 @@ mod tests {
 
         let url = format!("sqlite://{}", path.display());
         let database = SqliteDatabase::from_url(&url, dir.path()).expect("valid url");
-        let tables = database.introspect().await.expect("introspects");
+        let tables = database
+            .introspect("_sqlx_migrations")
+            .await
+            .expect("introspects");
 
         let users = tables
             .iter()
@@ -213,7 +218,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let database = SqliteDatabase::from_url("sqlite://nope.db", dir.path()).expect("valid url");
         assert!(matches!(
-            database.introspect().await,
+            database.introspect("_sqlx_migrations").await,
             Err(IntrospectError::DatabaseMissing { .. })
         ));
     }

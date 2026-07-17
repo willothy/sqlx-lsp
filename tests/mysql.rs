@@ -51,7 +51,10 @@ async fn introspects_tables_views_and_columns() {
     let (_container, url) = database_with_fixture_schema().await;
 
     let database = MySqlDatabase::from_url(&url).expect("valid url");
-    let tables = database.introspect().await.expect("introspects");
+    let tables = database
+        .introspect("_sqlx_migrations")
+        .await
+        .expect("introspects");
 
     let users = tables
         .iter()
@@ -136,7 +139,10 @@ async fn live_database_merges_into_schema_index() {
 
     let database = LiveDatabase::from_url(&url, DatabaseKind::MySql, std::path::Path::new("/"))
         .expect("valid url");
-    let tables = database.introspect().await.expect("introspects");
+    let tables = database
+        .introspect("_sqlx_migrations")
+        .await
+        .expect("introspects");
     schema.merge_database_tables(tables);
 
     let users = schema.table("users").expect("exists");

@@ -47,7 +47,10 @@ async fn introspects_tables_views_and_columns() {
 
     let database =
         LiveDatabase::from_url(&url, DatabaseKind::Sqlite, dir.path()).expect("valid url");
-    let tables = database.introspect().await.expect("introspects");
+    let tables = database
+        .introspect("_sqlx_migrations")
+        .await
+        .expect("introspects");
 
     let users = tables
         .iter()
@@ -89,6 +92,15 @@ async fn introspects_tables_views_and_columns() {
 
     // sqlx's bookkeeping table is not part of the user's schema.
     assert!(!tables.iter().any(|table| table.name == "_sqlx_migrations"));
+
+    // A renamed bookkeeping table (sqlx.toml `[migrate] table-name`) is
+    // excluded by whatever name the config resolves to.
+    let renamed = database
+        .introspect("memberships")
+        .await
+        .expect("introspects");
+    assert!(!renamed.iter().any(|table| table.name == "memberships"));
+    assert!(renamed.iter().any(|table| table.name == "users"));
 }
 
 #[tokio::test]
@@ -131,7 +143,10 @@ async fn live_database_merges_into_schema_index() {
 
     let database =
         LiveDatabase::from_url(&url, DatabaseKind::Sqlite, dir.path()).expect("valid url");
-    let tables = database.introspect().await.expect("introspects");
+    let tables = database
+        .introspect("_sqlx_migrations")
+        .await
+        .expect("introspects");
     schema.merge_database_tables(tables);
 
     let users = schema.table("users").expect("exists");

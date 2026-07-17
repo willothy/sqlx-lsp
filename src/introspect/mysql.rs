@@ -51,8 +51,9 @@ impl MySqlDatabase {
     }
 
     /// Reads every table and view (with columns) of the URL's database from
-    /// `information_schema`.
-    pub async fn introspect(&self) -> Result<Vec<Table>, IntrospectError> {
+    /// `information_schema`, except the `migrations_table` sqlx uses for
+    /// bookkeeping.
+    pub async fn introspect(&self, migrations_table: &str) -> Result<Vec<Table>, IntrospectError> {
         let query_error = |source| IntrospectError::Query {
             backend: DatabaseKind::MySql,
             target: self.display_url.clone(),
@@ -70,9 +71,10 @@ impl MySqlDatabase {
         let relations = sqlx::query(
             "SELECT TABLE_NAME AS name, TABLE_TYPE AS kind \
              FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME != '_sqlx_migrations' \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME != ? \
              ORDER BY TABLE_NAME",
         )
+        .bind(migrations_table)
         .fetch_all(&mut connection)
         .await
         .map_err(query_error)?;

@@ -244,11 +244,19 @@ impl Workspace {
             } else if migrations.is_dir() {
                 dir = Some(migrations);
             }
-            (env, kind, schema, dir, notes)
+            let migrations_table = config.migrations_table().to_owned();
+            (env, kind, schema, dir, migrations_table, notes)
         })
         .await;
 
-        let (folder_env, folder_kind, mut folder_schema, folder_dir, notes) = match fallback {
+        let (
+            folder_env,
+            folder_kind,
+            mut folder_schema,
+            folder_dir,
+            folder_migrations_table,
+            notes,
+        ) = match fallback {
             Ok(parts) => parts,
             Err(join_error) => {
                 log.push((
@@ -260,6 +268,7 @@ impl Workspace {
                     global_kind,
                     Schema::default(),
                     None,
+                    "_sqlx_migrations".to_owned(),
                     LoadLog::new(),
                 )
             }
@@ -278,7 +287,15 @@ impl Workspace {
             && !folder_env.offline
             && let Some(url) = &folder_env.database_url
         {
-            introspect_into(&mut folder_schema, url, folder_kind, &root, log).await;
+            introspect_into(
+                &mut folder_schema,
+                url,
+                folder_kind,
+                &root,
+                &folder_migrations_table,
+                log,
+            )
+            .await;
         }
 
         for context in &contexts {
@@ -353,11 +370,12 @@ impl DbContext {
                     )),
                 }
             }
-            (env, kind, schema, applied, notes)
+            let migrations_table = config.migrations_table().to_owned();
+            (env, kind, schema, applied, migrations_table, notes)
         })
         .await;
 
-        let (env, kind, mut schema, applied, notes) = match loaded {
+        let (env, kind, mut schema, applied, migrations_table, notes) = match loaded {
             Ok(parts) => parts,
             Err(join_error) => {
                 log.push((
@@ -369,6 +387,7 @@ impl DbContext {
                     global_kind,
                     Schema::default(),
                     Vec::new(),
+                    "_sqlx_migrations".to_owned(),
                     LoadLog::new(),
                 )
             }
@@ -384,7 +403,7 @@ impl DbContext {
                 ),
             ));
         } else if let Some(url) = &env.database_url {
-            introspect_into(&mut schema, url, kind, &root, log).await;
+            introspect_into(&mut schema, url, kind, &root, &migrations_table, log).await;
         }
 
         log.push((
@@ -413,11 +432,14 @@ async fn introspect_into(
     url: &str,
     kind: DatabaseKind,
     root: &Path,
+    migrations_table: &str,
     log: &mut LoadLog,
 ) {
     match LiveDatabase::from_url(url, kind, root) {
         Ok(database) => {
-            match tokio::time::timeout(INTROSPECT_TIMEOUT, database.introspect()).await {
+            match tokio::time::timeout(INTROSPECT_TIMEOUT, database.introspect(migrations_table))
+                .await
+            {
                 Ok(Ok(tables)) => {
                     log.push((
                         MessageType::INFO,

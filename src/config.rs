@@ -56,6 +56,9 @@ pub struct MigrateConfig {
     /// The migrations directory (`migrations-dir`), relative to the crate
     /// root. Defaults to `./migrations`.
     pub migrations_dir: Option<String>,
+    /// The migrations bookkeeping table (`table-name`), optionally
+    /// schema-qualified. Defaults to `_sqlx_migrations`.
+    pub table_name: Option<String>,
 }
 
 /// The subset of `sqlx.toml` the language server consumes.
@@ -99,6 +102,19 @@ impl SqlxConfig {
                 .as_deref()
                 .unwrap_or(DEFAULT_MIGRATIONS_DIR),
         )
+    }
+
+    /// The bare name of the migrations bookkeeping table, which
+    /// introspection excludes from schema results. A schema-qualified
+    /// configured name (`foo._sqlx_migrations`) compares by its final
+    /// segment, matching how introspection sees relation names.
+    pub fn migrations_table(&self) -> &str {
+        let name = self
+            .migrate
+            .table_name
+            .as_deref()
+            .unwrap_or("_sqlx_migrations");
+        name.rsplit('.').next().unwrap_or(name)
     }
 }
 
@@ -168,6 +184,20 @@ date-time = "chrono"
         let config = SqlxConfig::load(dir.path()).expect("loads");
         assert_eq!(config.database_url_var(), "APP_DB");
         assert_eq!(config.migrate.migrations_dir, None);
+        // Schema-qualified bookkeeping names compare by table segment.
+        assert_eq!(config.migrations_table(), "_sqlx_migrations");
+    }
+
+    #[test]
+    fn renamed_bookkeeping_table_is_resolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("sqlx.toml"),
+            "[migrate]\ntable-name = \"meta.applied_migrations\"\n",
+        )
+        .expect("write config");
+        let config = SqlxConfig::load(dir.path()).expect("loads");
+        assert_eq!(config.migrations_table(), "applied_migrations");
     }
 
     #[test]
