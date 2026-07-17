@@ -26,12 +26,13 @@ Rust buffer coordinates, layering cleanly on top of rust-analyzer.
 - **Goto definition** — from any table, alias, or column reference to the
   defining statement in its migration.
 - **Find references & document highlight** — every use of a table or column
-  across open documents and the crate's migration files. Aliases and
+  across the whole workspace: open buffers, migration files, standalone
+  `.sql` files, and the query macros of closed Rust sources. Aliases and
   qualifiers count; CTEs stay scoped to their defining statement.
-- **Rename** — tables and columns, rewriting queries and migrations
-  together. Validates the new name (reserved words, collisions), refuses
-  objects that exist only in the live database, and sends versioned edits
-  to clients that support them.
+- **Rename** — tables and columns, rewriting queries and migrations across
+  the workspace, closed files included. Validates the new name (reserved
+  words, collisions), refuses objects that exist only in the live database,
+  and sends versioned edits to clients that support them.
 - **Diagnostics** — syntax errors, unknown tables and columns, and
   bind-parameter counts checked against a macro's arguments. Served by push
   and by pull (`textDocument/diagnostic`).
