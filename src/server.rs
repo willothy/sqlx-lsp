@@ -6,6 +6,7 @@ use sqlparser::keywords::{
 };
 use tokio::sync::{Notify, RwLock};
 use tower_lsp_server::ls_types::{
+    CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -32,7 +33,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::analysis::resolve::{self, ReferenceTarget, Resolved};
-use crate::analysis::{completion, definition, diagnostics, hover, semantic_tokens, symbols};
+use crate::analysis::{
+    actions, completion, definition, diagnostics, hover, semantic_tokens, symbols,
+};
 use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::embedded::{self, EmbeddedSql};
@@ -732,6 +735,7 @@ impl LanguageServer for Backend {
                 document_highlight_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -1002,6 +1006,43 @@ impl LanguageServer for Backend {
                 ))
         });
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
+    }
+
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> jsonrpc::Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let Some(open) = self.documents.get(&uri) else {
+            return Ok(None);
+        };
+        let workspace = self.workspace.read().await;
+        let context = workspace.context_for(&uri);
+        let actions = match open.language {
+            DocumentLanguage::Sql => {
+                let parsed = open.parsed(context.kind);
+                actions::quick_fixes(&open.document, &parsed, &context.schema, &uri, params.range)
+            }
+            DocumentLanguage::Rust => {
+                let extracted = open.extracted();
+                embedded::quick_fixes(
+                    &extracted,
+                    &context.schema,
+                    context.kind,
+                    &uri,
+                    params.range,
+                )
+            }
+        };
+        if actions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            actions
+                .into_iter()
+                .map(CodeActionOrCommand::CodeAction)
+                .collect(),
+        ))
     }
 
     async fn document_symbol(

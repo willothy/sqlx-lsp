@@ -10,8 +10,8 @@
 //! by the SQL parser as a backslash and an `n`.
 
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionTextEdit, Diagnostic, DiagnosticSeverity, Hover, Location, Position,
-    Range, SemanticToken,
+    CodeAction, CompletionItem, CompletionTextEdit, Diagnostic, DiagnosticSeverity, Hover,
+    Location, Position, Range, SemanticToken, Uri,
 };
 use tree_sitter::{Node, Parser};
 
@@ -512,6 +512,57 @@ pub fn references_to(
         for range in crate::analysis::resolve::references_to(&sql_document, &parsed, schema, target)
         {
             all.push(region.to_host_range(range));
+        }
+    }
+    all
+}
+
+/// Quick-fix actions for the SQL regions intersecting `range`, with the
+/// suggestion edits and diagnostics mapped to host coordinates.
+pub fn quick_fixes(
+    embedded: &EmbeddedSql,
+    schema: &Schema,
+    kind: DatabaseKind,
+    uri: &Uri,
+    range: Range,
+) -> Vec<CodeAction> {
+    let mut all = Vec::new();
+    for region in &embedded.regions {
+        if range.end < region.range.start || region.range.end < range.start {
+            continue;
+        }
+        let sql_document = Document::new(region.text.clone());
+        let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
+        // Clamp the requested range to the region before translating it.
+        let start = if range.start <= region.range.start {
+            Position::new(0, 0)
+        } else {
+            region.to_embedded(range.start)
+        };
+        let end = region.to_embedded(range.end.min(region.range.end));
+        let embedded_range = Range { start, end };
+        for mut action in crate::analysis::actions::quick_fixes(
+            &sql_document,
+            &parsed,
+            schema,
+            uri,
+            embedded_range,
+        ) {
+            if let Some(diagnostics) = &mut action.diagnostics {
+                for diagnostic in diagnostics {
+                    diagnostic.range = region.to_host_range(diagnostic.range);
+                }
+            }
+            if let Some(edit) = &mut action.edit
+                && let Some(changes) = &mut edit.changes
+            {
+                for edits in changes.values_mut() {
+                    for text_edit in edits {
+                        text_edit.range = region.to_host_range(text_edit.range);
+                    }
+                }
+            }
+            all.push(action);
         }
     }
     all

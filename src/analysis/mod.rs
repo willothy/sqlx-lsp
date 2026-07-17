@@ -1,5 +1,6 @@
 //! Language feature analyses over parsed SQL documents.
 
+pub mod actions;
 pub mod completion;
 pub mod definition;
 pub mod diagnostics;

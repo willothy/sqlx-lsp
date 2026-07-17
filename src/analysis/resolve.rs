@@ -431,6 +431,25 @@ pub struct UnresolvedReference {
     pub span: Span,
     /// Why it did not resolve.
     pub message: String,
+    /// What kind of name failed to resolve, for suggesting replacements.
+    pub kind: UnresolvedKind,
+}
+
+/// The kind of name an [`UnresolvedReference`] failed to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnresolvedKind {
+    /// A relation name matching nothing in scope or the schema.
+    Table {
+        /// The name as written.
+        name: String,
+    },
+    /// A column missing from its (known) relation.
+    Column {
+        /// The resolved owning relation's name.
+        table: String,
+        /// The column name as written.
+        name: String,
+    },
 }
 
 /// References in `parsed` that resolve to nothing: unknown relations in
@@ -486,6 +505,7 @@ pub fn unresolved_references(parsed: &ParsedSql, schema: &Schema) -> Vec<Unresol
                     unresolved.push(UnresolvedReference {
                         span: candidate.span,
                         message: format!("unknown table or view `{name}`"),
+                        kind: UnresolvedKind::Table { name: name.clone() },
                     });
                 }
             }
@@ -500,6 +520,10 @@ pub fn unresolved_references(parsed: &ParsedSql, schema: &Schema) -> Vec<Unresol
                     unresolved.push(UnresolvedReference {
                         span: candidate.span,
                         message: format!("no column `{name}` in `{}`", table.name),
+                        kind: UnresolvedKind::Column {
+                            table: table.name.clone(),
+                            name: name.clone(),
+                        },
                     });
                 }
             }

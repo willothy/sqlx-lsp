@@ -678,6 +678,40 @@ fn workspace_symbols_search_the_schema_index() {
 }
 
 #[test]
+fn quick_fixes_suggest_replacements_for_misspelled_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM usrs");
+
+    let actions = client.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "range": {
+                "start": { "line": 0, "character": 15 },
+                "end": { "line": 0, "character": 19 },
+            },
+            "context": { "diagnostics": [] },
+        }),
+    );
+    let actions = actions.as_array().expect("actions");
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0]["title"], "Replace with `users`");
+    assert_eq!(actions[0]["kind"], "quickfix");
+    let edits = &actions[0]["edit"]["changes"][&query_uri];
+    assert_eq!(edits[0]["newText"], "users", "{actions:?}");
+    assert_eq!(edits[0]["range"]["start"]["character"], 15);
+}
+
+#[test]
 fn document_symbols_outline_ddl_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
