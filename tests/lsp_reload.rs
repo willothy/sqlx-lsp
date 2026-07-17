@@ -241,6 +241,22 @@ impl LspClient {
             .unwrap_or_default()
     }
 
+    /// Blocks until a `publishDiagnostics` notification for `uri` arrives
+    /// and returns its diagnostics array.
+    fn wait_for_diagnostics(&mut self, uri: &str) -> Vec<Value> {
+        loop {
+            let message = self.next_message();
+            if message["method"] == "textDocument/publishDiagnostics"
+                && message["params"]["uri"] == uri
+            {
+                return message["params"]["diagnostics"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+    }
+
     fn hover_text(&mut self, uri: &str, line: u32, character: u32) -> String {
         let result = self.request(
             "textDocument/hover",
@@ -355,6 +371,46 @@ fn exits_cleanly_on_the_exit_notification() {
         .wait_for_exit(Duration::from_secs(10))
         .expect("server exits after the exit notification");
     assert!(status.success(), "unexpected exit status: {status}");
+}
+
+#[test]
+fn diagnostics_flag_syntax_errors_and_unknown_references() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    // An unknown table is a warning.
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM posts");
+    let diagnostics = client.wait_for_diagnostics(&query_uri);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0]["severity"], 2);
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown table")),
+        "{diagnostics:?}"
+    );
+
+    // Fixing the reference clears it.
+    client.change(&query_uri, 2, "SELECT id FROM users");
+    let diagnostics = client.wait_for_diagnostics(&query_uri);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+    // A syntax problem is an error.
+    client.change(&query_uri, 3, "SELECT FROM WHERE;");
+    let diagnostics = client.wait_for_diagnostics(&query_uri);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["severity"] == 1),
+        "{diagnostics:?}"
+    );
 }
 
 #[test]

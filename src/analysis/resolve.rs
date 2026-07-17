@@ -304,6 +304,93 @@ impl Visitor for References<'_> {
     }
 }
 
+/// A reference the schema cannot account for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedReference {
+    /// The span of the offending identifier.
+    pub span: Span,
+    /// Why it did not resolve.
+    pub message: String,
+}
+
+/// References in `parsed` that resolve to nothing: unknown relations in
+/// query statements, and qualified columns missing from their (known)
+/// relation.
+///
+/// DDL statements are exempt — they define names rather than reference
+/// them — and an empty schema produces nothing, since every reference would
+/// then be noise. Unqualified columns are also left undiagnosed: projection
+/// aliases and other name sources the index does not model would make those
+/// reports unreliable.
+pub fn unresolved_references(parsed: &ParsedSql, schema: &Schema) -> Vec<UnresolvedReference> {
+    if schema.tables().next().is_none() {
+        return Vec::new();
+    }
+    let references = References::collect(&parsed.statements, schema);
+    let ddl: Vec<bool> = parsed
+        .statements
+        .iter()
+        .map(|statement| {
+            matches!(
+                statement,
+                Statement::CreateTable(_)
+                    | Statement::CreateView(_)
+                    | Statement::AlterTable(_)
+                    | Statement::Drop { .. }
+            )
+        })
+        .collect();
+
+    let mut unresolved = Vec::new();
+    for candidate in &references.candidates {
+        if ddl.get(candidate.statement).copied().unwrap_or(false) {
+            continue;
+        }
+        let scope = &references.scopes[candidate.statement];
+        let locals = &references.locals[candidate.statement];
+        let find_table = |name: &str| {
+            locals
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(name))
+                .or_else(|| {
+                    let lowered = name.to_ascii_lowercase();
+                    scope
+                        .get(&lowered)
+                        .and_then(|target| schema.table(target))
+                        .or_else(|| schema.table(name))
+                })
+        };
+        match &candidate.kind {
+            CandidateKind::Table { name } => {
+                if find_table(name).is_none() {
+                    unresolved.push(UnresolvedReference {
+                        span: candidate.span,
+                        message: format!("unknown table or view `{name}`"),
+                    });
+                }
+            }
+            CandidateKind::Column {
+                qualifier: Some(qualifier),
+                name,
+            } => {
+                if let Some(table) = find_table(qualifier)
+                    && !table.columns.is_empty()
+                    && table.column(name).is_none()
+                {
+                    unresolved.push(UnresolvedReference {
+                        span: candidate.span,
+                        message: format!("no column `{name}` in `{}`", table.name),
+                    });
+                }
+            }
+            CandidateKind::Column {
+                qualifier: None, ..
+            } => {}
+        }
+    }
+    unresolved
+}
+
 /// The relations each statement in `statements` defines locally (CTEs and
 /// aliased derived subqueries), flattened. Their columns resolve through
 /// `schema` where they reference real tables.

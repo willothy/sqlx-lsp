@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::analysis::{completion, definition, hover, semantic_tokens};
+use crate::analysis::{completion, definition, diagnostics, hover, semantic_tokens};
 use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::embedded::{self, EmbeddedSql};
@@ -220,6 +220,43 @@ impl ServerState {
         self.reload_notify.notify_one();
     }
 
+    /// Computes and publishes diagnostics for one open document.
+    async fn publish_diagnostics_for(&self, uri: &Uri) {
+        let diagnostics = {
+            let Some(open) = self.documents.get(uri) else {
+                return;
+            };
+            let workspace = self.workspace.read().await;
+            let context = workspace.context_for(uri);
+            match open.language {
+                DocumentLanguage::Sql => {
+                    let parsed = open.parsed(context.kind);
+                    diagnostics::diagnostics(&open.document, &parsed, &context.schema)
+                }
+                DocumentLanguage::Rust => {
+                    let extracted = open.extracted();
+                    embedded::diagnostics(&extracted, &context.schema, context.kind)
+                }
+            }
+        };
+        self.client
+            .publish_diagnostics(uri.clone(), diagnostics, None)
+            .await;
+    }
+
+    /// Republishes diagnostics for every open document, after the schema
+    /// contexts changed.
+    async fn publish_all_diagnostics(&self) {
+        let uris: Vec<Uri> = self
+            .documents
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for uri in uris {
+            self.publish_diagnostics_for(&uri).await;
+        }
+    }
+
     /// The full semantic-token stream for `open` under `kind`.
     fn compute_tokens(&self, open: &OpenDocument, kind: DatabaseKind) -> Vec<SemanticToken> {
         match open.language {
@@ -289,6 +326,9 @@ impl ServerState {
             self.client.log_message(message_type, message).await;
         }
         self.register_watchers().await;
+        // The contexts changed, so every open document's diagnostics may
+        // have too.
+        self.publish_all_diagnostics().await;
 
         if let Some(progress) = progress {
             progress
@@ -482,10 +522,12 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
         let language = DocumentLanguage::detect(Some(&document.language_id), &document.uri);
+        let uri = document.uri.clone();
         self.documents.insert(
             document.uri,
             OpenDocument::new(Document::new(document.text), language),
         );
+        self.publish_diagnostics_for(&uri).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -511,10 +553,13 @@ impl LanguageServer for Backend {
                     return;
                 };
                 let language = DocumentLanguage::detect(None, &uri);
-                self.documents
-                    .insert(uri, OpenDocument::new(Document::new(change.text), language));
+                self.documents.insert(
+                    uri.clone(),
+                    OpenDocument::new(Document::new(change.text), language),
+                );
             }
         }
+        self.publish_diagnostics_for(&uri).await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -525,6 +570,10 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.remove(&params.text_document.uri);
+        // Closed documents keep no diagnostics.
+        self.client
+            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+            .await;
     }
 
     async fn completion(

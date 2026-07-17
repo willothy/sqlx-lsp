@@ -9,7 +9,9 @@
 //! losslessly, while a rare `\n` escape inside a plain string is simply seen
 //! by the SQL parser as a backslash and an `n`.
 
-use tower_lsp_server::ls_types::{CompletionItem, Hover, Location, Position, Range, SemanticToken};
+use tower_lsp_server::ls_types::{
+    CompletionItem, Diagnostic, Hover, Location, Position, Range, SemanticToken,
+};
 use tree_sitter::{Node, Parser};
 
 use crate::analysis::semantic_tokens;
@@ -345,6 +347,23 @@ pub fn definition(
         region.to_embedded(position),
         schema,
     )
+}
+
+/// Diagnostics for every SQL region of a Rust document, mapped to host
+/// coordinates.
+pub fn diagnostics(embedded: &EmbeddedSql, schema: &Schema, kind: DatabaseKind) -> Vec<Diagnostic> {
+    let mut all = Vec::new();
+    for region in &embedded.regions {
+        let sql_document = Document::new(region.text.clone());
+        let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
+        for mut diagnostic in
+            crate::analysis::diagnostics::diagnostics(&sql_document, &parsed, schema)
+        {
+            diagnostic.range = region.to_host_range(diagnostic.range);
+            all.push(diagnostic);
+        }
+    }
+    all
 }
 
 /// Semantic tokens for every SQL region in a Rust document, shifted to host
