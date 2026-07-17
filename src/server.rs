@@ -8,8 +8,8 @@ use tower_lsp_server::ls_types::{
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, Location, MessageType, OneOf, ProgressToken, Range,
-    ReferenceParams, Registration, SemanticToken, SemanticTokens, SemanticTokensDelta,
+    InitializeResult, InitializedParams, Location, MessageType, OneOf, Position, ProgressToken,
+    Range, ReferenceParams, Registration, SemanticToken, SemanticTokens, SemanticTokensDelta,
     SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensFullOptions,
     SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
     SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
@@ -257,6 +257,95 @@ impl ServerState {
         for uri in uris {
             self.publish_diagnostics_for(&uri).await;
         }
+    }
+
+    /// The reference target at `position` in `uri` and every location that
+    /// resolves to it — in the requesting document, other open documents of
+    /// the same context, and the context's migration files — ordered and
+    /// deduplicated. `include_declaration` controls whether the
+    /// schema-recorded defining identifier is part of the result. `None`
+    /// when the document is not open or the position holds no resolvable
+    /// reference.
+    async fn reference_locations(
+        &self,
+        uri: &Uri,
+        position: Position,
+        include_declaration: bool,
+    ) -> Option<(ReferenceTarget, Vec<Location>)> {
+        let workspace = self.workspace.read().await;
+        let context = workspace.context_for(uri);
+
+        // The target under the cursor and the requesting document's own
+        // matching ranges.
+        let (target, own_ranges) = {
+            let open = self.documents.get(uri)?;
+            match open.language {
+                DocumentLanguage::Sql => {
+                    let parsed = open.parsed(context.kind);
+                    let target = resolve::reference_target(
+                        &open.document,
+                        &parsed,
+                        position,
+                        &context.schema,
+                    )?;
+                    let ranges =
+                        resolve::references_to(&open.document, &parsed, &context.schema, &target);
+                    (target, ranges)
+                }
+                DocumentLanguage::Rust => {
+                    let extracted = open.extracted();
+                    embedded::references_at(&extracted, position, &context.schema, context.kind)?
+                }
+            }
+        };
+
+        let mut locations: Vec<Location> = own_ranges
+            .into_iter()
+            .map(|range| Location::new(uri.clone(), range))
+            .collect();
+
+        // A query-local relation exists only inside the requesting document;
+        // schema objects are searched across the context.
+        if !target.is_document_local() {
+            self.collect_context_references(&workspace, uri, context, &target, &mut locations);
+        }
+
+        let declaration = match &target {
+            ReferenceTarget::Table { name } => context
+                .schema
+                .table(name)
+                .and_then(|table| table.location.clone()),
+            ReferenceTarget::Column { table, column } => {
+                context.schema.table(table).and_then(|table| {
+                    table
+                        .column(column)
+                        .and_then(|column| column.location.clone())
+                        .or_else(|| table.location.clone())
+                })
+            }
+            ReferenceTarget::LocalTable { .. } | ReferenceTarget::LocalColumn { .. } => None,
+        }
+        .map(Location::from);
+        if include_declaration {
+            if let Some(declaration) = declaration
+                && !locations.contains(&declaration)
+            {
+                locations.push(declaration);
+            }
+        } else if let Some(declaration) = declaration {
+            locations.retain(|location| *location != declaration);
+        }
+
+        locations.sort_by(|a, b| {
+            (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+                b.uri.as_str(),
+                b.range.start.line,
+                b.range.start.character,
+            ))
+        });
+        locations.dedup();
+
+        Some((target, locations))
     }
 
     /// Extends `locations` with references to `target` found in every other
@@ -716,91 +805,12 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let workspace = self.workspace.read().await;
-        let context = workspace.context_for(&uri);
-
-        // The target under the cursor and the requesting document's own
-        // matching ranges.
-        let (target, own_ranges) = {
-            let Some(open) = self.documents.get(&uri) else {
-                return Ok(None);
-            };
-            match open.language {
-                DocumentLanguage::Sql => {
-                    let parsed = open.parsed(context.kind);
-                    let Some(target) = resolve::reference_target(
-                        &open.document,
-                        &parsed,
-                        position,
-                        &context.schema,
-                    ) else {
-                        return Ok(None);
-                    };
-                    let ranges =
-                        resolve::references_to(&open.document, &parsed, &context.schema, &target);
-                    (target, ranges)
-                }
-                DocumentLanguage::Rust => {
-                    let extracted = open.extracted();
-                    let Some((target, ranges)) = embedded::references_at(
-                        &extracted,
-                        position,
-                        &context.schema,
-                        context.kind,
-                    ) else {
-                        return Ok(None);
-                    };
-                    (target, ranges)
-                }
-            }
+        let Some((_, locations)) = self
+            .reference_locations(&uri, position, params.context.include_declaration)
+            .await
+        else {
+            return Ok(None);
         };
-
-        let mut locations: Vec<Location> = own_ranges
-            .into_iter()
-            .map(|range| Location::new(uri.clone(), range))
-            .collect();
-
-        // A query-local relation exists only inside the requesting document;
-        // schema objects are searched across the context.
-        if !target.is_document_local() {
-            self.collect_context_references(&workspace, &uri, context, &target, &mut locations);
-        }
-
-        let declaration = match &target {
-            ReferenceTarget::Table { name } => context
-                .schema
-                .table(name)
-                .and_then(|table| table.location.clone()),
-            ReferenceTarget::Column { table, column } => {
-                context.schema.table(table).and_then(|table| {
-                    table
-                        .column(column)
-                        .and_then(|column| column.location.clone())
-                        .or_else(|| table.location.clone())
-                })
-            }
-            ReferenceTarget::LocalTable { .. } | ReferenceTarget::LocalColumn { .. } => None,
-        }
-        .map(Location::from);
-        if params.context.include_declaration {
-            if let Some(declaration) = declaration
-                && !locations.contains(&declaration)
-            {
-                locations.push(declaration);
-            }
-        } else if let Some(declaration) = declaration {
-            locations.retain(|location| *location != declaration);
-        }
-
-        locations.sort_by(|a, b| {
-            (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
-                b.uri.as_str(),
-                b.range.start.line,
-                b.range.start.character,
-            ))
-        });
-        locations.dedup();
-
         if locations.is_empty() {
             return Ok(None);
         }
