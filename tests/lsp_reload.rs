@@ -180,6 +180,30 @@ impl LspClient {
         );
     }
 
+    /// Sends an incremental (ranged) content change.
+    fn change_range(
+        &mut self,
+        uri: &str,
+        version: i64,
+        start: (u32, u32),
+        end: (u32, u32),
+        text: &str,
+    ) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": start.0, "character": start.1 },
+                        "end": { "line": end.0, "character": end.1 },
+                    },
+                    "text": text,
+                }],
+            }),
+        );
+    }
+
     fn completion_labels(&mut self, uri: &str, line: u32, character: u32) -> Vec<String> {
         let result = self.request(
             "textDocument/completion",
@@ -314,6 +338,32 @@ fn exits_cleanly_on_the_exit_notification() {
         .wait_for_exit(Duration::from_secs(10))
         .expect("server exits after the exit notification");
     assert!(status.success(), "unexpected exit status: {status}");
+}
+
+#[test]
+fn incremental_changes_update_the_document() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM users");
+
+    // Replace `id` with `email` via a ranged change.
+    client.change_range(&query_uri, 2, (0, 7), (0, 9), "email");
+    let hover = client.hover_text(&query_uri, 0, 8);
+    assert!(hover.contains("users.email TEXT NOT NULL"), "{hover}");
+
+    // A second ranged change appends a WHERE clause; completion after the
+    // rewritten text still sees the document consistently.
+    client.change_range(&query_uri, 3, (0, 23), (0, 23), " WHERE ");
+    let labels = client.completion_labels(&query_uri, 0, 30);
+    assert!(labels.contains(&"email".to_owned()), "{labels:?}");
 }
 
 #[test]

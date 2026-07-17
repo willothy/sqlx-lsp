@@ -9,6 +9,25 @@
 use sqlparser::tokenizer::{Location as SqlLocation, Span as SqlSpan};
 use tower_lsp_server::ls_types::{Position, Range};
 
+/// The byte-level shape of one applied content change, in the coordinates
+/// incremental reparsers (tree-sitter) consume: byte offsets plus 0-based
+/// (row, byte column) points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedEdit {
+    /// Byte offset where the change starts.
+    pub start_byte: usize,
+    /// Byte offset where the replaced text ended, in the old text.
+    pub old_end_byte: usize,
+    /// Byte offset where the inserted text ends, in the new text.
+    pub new_end_byte: usize,
+    /// (row, byte column) of the change start.
+    pub start_point: (usize, usize),
+    /// (row, byte column) where the replaced text ended, in the old text.
+    pub old_end_point: (usize, usize),
+    /// (row, byte column) where the inserted text ends, in the new text.
+    pub new_end_point: (usize, usize),
+}
+
 /// The text of one open document.
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -29,6 +48,37 @@ impl Document {
     pub fn update(&mut self, text: String) {
         self.line_starts = Self::compute_line_starts(&text);
         self.text = text;
+    }
+
+    /// Applies an incremental content change, replacing `range` with
+    /// `new_text`. Out-of-range positions clamp the way [`Self::offset_at`]
+    /// clamps. Returns the byte-level shape of the edit so incremental
+    /// reparsers can shift their trees.
+    pub fn apply_change(&mut self, range: Range, new_text: &str) -> AppliedEdit {
+        let start_byte = self.offset_at(range.start);
+        let old_end_byte = self.offset_at(range.end).max(start_byte);
+        let start_point = self.byte_point(start_byte);
+        let old_end_point = self.byte_point(old_end_byte);
+
+        self.text.replace_range(start_byte..old_end_byte, new_text);
+        self.line_starts = Self::compute_line_starts(&self.text);
+
+        let new_end_byte = start_byte + new_text.len();
+        AppliedEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_point,
+            old_end_point,
+            new_end_point: self.byte_point(new_end_byte),
+        }
+    }
+
+    /// The 0-based (row, byte column) of a byte offset in the current text.
+    fn byte_point(&self, offset: usize) -> (usize, usize) {
+        // `line_starts[0]` is 0, so the partition point is at least 1.
+        let row = self.line_starts.partition_point(|&start| start <= offset) - 1;
+        (row, offset - self.line_starts[row])
     }
 
     /// The current document text.
@@ -197,6 +247,45 @@ mod tests {
         assert_eq!(d.offset_at(Position::new(0, 0)), 0);
         assert_eq!(d.offset_at(Position::new(0, 2)), 4);
         assert_eq!(d.offset_at(Position::new(0, 3)), 5);
+    }
+
+    #[test]
+    fn apply_change_replaces_ranges_and_reports_edit_shape() {
+        let mut d = doc("SELECT id\nFROM users");
+        // Replace `id` with `email`.
+        let edit = d.apply_change(
+            Range::new(Position::new(0, 7), Position::new(0, 9)),
+            "email",
+        );
+        assert_eq!(d.text(), "SELECT email\nFROM users");
+        assert_eq!(edit.start_byte, 7);
+        assert_eq!(edit.old_end_byte, 9);
+        assert_eq!(edit.new_end_byte, 12);
+        assert_eq!(edit.start_point, (0, 7));
+        assert_eq!(edit.old_end_point, (0, 9));
+        assert_eq!(edit.new_end_point, (0, 12));
+
+        // A multi-line insertion moves the end point to a later row.
+        let edit = d.apply_change(
+            Range::new(Position::new(1, 10), Position::new(1, 10)),
+            "\nWHERE id = 1",
+        );
+        assert_eq!(d.text(), "SELECT email\nFROM users\nWHERE id = 1");
+        assert_eq!(edit.start_point, (1, 10));
+        assert_eq!(edit.new_end_point, (2, 12));
+
+        // Deleting across lines shrinks the text.
+        let edit = d.apply_change(Range::new(Position::new(0, 12), Position::new(2, 0)), "");
+        assert_eq!(d.text(), "SELECT emailWHERE id = 1");
+        assert_eq!(edit.new_end_byte, edit.start_byte);
+    }
+
+    #[test]
+    fn apply_change_handles_multibyte_positions() {
+        // '😀' is 4 UTF-8 bytes, 2 UTF-16 units.
+        let mut d = doc("😀 x");
+        d.apply_change(Range::new(Position::new(0, 3), Position::new(0, 4)), "yz");
+        assert_eq!(d.text(), "😀 yz");
     }
 
     #[test]

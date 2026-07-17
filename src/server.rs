@@ -357,7 +357,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                         ..TextDocumentSyncOptions::default()
                     },
@@ -416,17 +416,32 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // Full sync: the last change carries the complete text.
-        let Some(change) = params.content_changes.into_iter().next_back() else {
-            return;
-        };
         let uri = params.text_document.uri;
         match self.documents.get_mut(&uri) {
             Some(mut open) => {
-                open.document.update(change.text);
+                // Changes apply in order; each range refers to the document
+                // state left by the previous change. A change without a
+                // range replaces the whole text.
+                for change in params.content_changes {
+                    match change.range {
+                        Some(range) => {
+                            open.document.apply_change(range, &change.text);
+                        }
+                        None => open.document.update(change.text),
+                    }
+                }
                 open.invalidate();
             }
             None => {
+                // An unopened document can only be synchronized from a
+                // full-text change.
+                let Some(change) = params
+                    .content_changes
+                    .into_iter()
+                    .rfind(|change| change.range.is_none())
+                else {
+                    return;
+                };
                 let language = DocumentLanguage::detect(None, &uri);
                 self.documents
                     .insert(uri, OpenDocument::new(Document::new(change.text), language));
