@@ -678,6 +678,35 @@ fn workspace_symbols_search_the_schema_index() {
 }
 
 #[test]
+fn document_symbols_outline_ddl_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let migration_uri = file_uri(&dir.path().join("migrations").join("1_users.sql"));
+    client.open(
+        &migration_uri,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    );
+
+    let symbols = client.request(
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": migration_uri } }),
+    );
+    let symbols = symbols.as_array().expect("symbols");
+    assert_eq!(symbols.len(), 1, "{symbols:?}");
+    assert_eq!(symbols[0]["name"], "users");
+    let children = symbols[0]["children"].as_array().expect("columns");
+    assert_eq!(children.len(), 1, "{children:?}");
+    assert_eq!(children[0]["name"], "id");
+}
+
+#[test]
 fn document_highlight_marks_occurrences_in_the_requesting_document() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");

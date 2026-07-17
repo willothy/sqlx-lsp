@@ -6,3 +6,4 @@ pub mod diagnostics;
 pub mod hover;
 pub mod resolve;
 pub mod semantic_tokens;
+pub mod symbols;

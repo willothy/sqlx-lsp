@@ -10,18 +10,19 @@ use tower_lsp_server::ls_types::{
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, MessageType, OneOf, Position, PrepareRenameResponse, ProgressToken, Range,
-    ReferenceParams, Registration, RenameOptions, RenameParams, SemanticToken, SemanticTokens,
-    SemanticTokensDelta, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
-    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Unregistration, Uri,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    DocumentSymbolParams, DocumentSymbolResponse, FileSystemWatcher, GlobPattern,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf, Position,
+    PrepareRenameResponse, ProgressToken, Range, ReferenceParams, Registration, RenameOptions,
+    RenameParams, SemanticToken, SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    SymbolInformation, SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit,
+    Unregistration, Uri, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
@@ -31,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::analysis::resolve::{self, ReferenceTarget, Resolved};
-use crate::analysis::{completion, definition, diagnostics, hover, semantic_tokens};
+use crate::analysis::{completion, definition, diagnostics, hover, semantic_tokens, symbols};
 use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::embedded::{self, EmbeddedSql};
@@ -730,6 +731,7 @@ impl LanguageServer for Backend {
                 references_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -1000,6 +1002,31 @@ impl LanguageServer for Backend {
                 ))
         });
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> jsonrpc::Result<Option<DocumentSymbolResponse>> {
+        let Some(open) = self.documents.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        // Rust documents get their outline from rust-analyzer.
+        if open.language != DocumentLanguage::Sql {
+            return Ok(None);
+        }
+        let kind = self
+            .workspace
+            .read()
+            .await
+            .context_for(&params.text_document.uri)
+            .kind;
+        let parsed = open.parsed(kind);
+        let symbols = symbols::document_symbols(&open.document, &parsed);
+        if symbols.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
     async fn document_highlight(
