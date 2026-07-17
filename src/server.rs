@@ -1,7 +1,7 @@
 //! The language server backend.
 
 use dashmap::DashMap;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
@@ -112,25 +112,64 @@ impl OpenDocument {
     }
 }
 
-/// The tower-lsp backend serving SQL language features.
+/// The tower-lsp backend serving SQL language features. A thin handle over
+/// [`ServerState`] so that the reload worker can share the state.
 pub struct Backend {
+    state: Arc<ServerState>,
+}
+
+impl std::ops::Deref for Backend {
+    type Target = ServerState;
+
+    fn deref(&self) -> &ServerState {
+        &self.state
+    }
+}
+
+/// The server's shared state: documents, workspace contexts, and the
+/// machinery that rebuilds them.
+pub struct ServerState {
     client: Client,
     documents: DashMap<Uri, OpenDocument>,
     workspace: RwLock<Workspace>,
     /// Set once the client rejects dynamic watcher registration, so reloads
     /// stop retrying (the did_save fallback covers those clients).
     watchers_unavailable: AtomicBool,
+    /// Wakes the reload worker. Requests coalesce: any number of triggers
+    /// while a reload runs result in exactly one follow-up reload.
+    reload_notify: Notify,
 }
 
 impl Backend {
-    /// Creates a backend bound to `client`.
+    /// Creates a backend bound to `client` and spawns its reload worker.
     pub fn new(client: Client) -> Self {
-        Backend {
+        let state = Arc::new(ServerState {
             client,
             documents: DashMap::new(),
             workspace: RwLock::new(Workspace::default()),
             watchers_unavailable: AtomicBool::new(false),
-        }
+            reload_notify: Notify::new(),
+        });
+
+        // Reloads run here rather than in notification handlers: a slow
+        // load (cargo metadata, an unresponsive database) must not delay
+        // the document synchronization notifications queued behind it.
+        let worker = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                worker.reload_notify.notified().await;
+                worker.reload_workspace().await;
+            }
+        });
+
+        Backend { state }
+    }
+}
+
+impl ServerState {
+    /// Schedules a workspace reload on the worker and returns immediately.
+    fn request_reload(&self) {
+        self.reload_notify.notify_one();
     }
 
     /// Rebuilds workspace state, forwards the resulting log lines to the
@@ -310,7 +349,7 @@ impl LanguageServer for Backend {
         // Loads the workspace and registers the file watchers derived from
         // it. Clients without dynamic-registration support reject the
         // watchers; the did_save fallback still keeps the index fresh.
-        self.reload_workspace().await;
+        self.request_reload();
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
@@ -347,7 +386,7 @@ impl LanguageServer for Backend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         if self.affects_workspace(&params.text_document.uri).await {
-            self.reload_workspace().await;
+            self.request_reload();
         }
     }
 
@@ -500,13 +539,13 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        self.reload_workspace().await;
+        self.request_reload();
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in &params.changes {
             if self.affects_workspace(&change.uri).await {
-                self.reload_workspace().await;
+                self.request_reload();
                 return;
             }
         }
