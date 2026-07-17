@@ -285,6 +285,69 @@ fn schema_changes_reload_while_the_session_is_open() {
     assert!(hover.contains("0001_users.sql"), "{hover}");
 }
 
+#[test]
+fn workspace_folder_changes_rebuild_contexts_mid_session() {
+    let dir_a = tempfile::tempdir().expect("tempdir");
+    let dir_b = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir_a.path().join("migrations")).expect("mkdir");
+    std::fs::create_dir_all(dir_b.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir_a.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    std::fs::write(
+        dir_b.path().join("migrations").join("1_posts.sql"),
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+
+    let mut client = LspClient::start(dir_a.path());
+
+    // A document in folder B, which is not part of the workspace yet: it is
+    // served by the workspace-wide fallback, which only knows folder A.
+    let query_uri = file_uri(&dir_b.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM ");
+    let labels = client.completion_labels(&query_uri, 0, 15);
+    assert!(labels.contains(&"users".to_owned()), "{labels:?}");
+    assert!(!labels.contains(&"posts".to_owned()), "{labels:?}");
+
+    // The user adds folder B to the workspace.
+    client.notify(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [{ "uri": file_uri(dir_b.path()), "name": "b" }],
+                "removed": [],
+            }
+        }),
+    );
+    client.wait_for_load();
+
+    // The document now belongs to folder B's context, which is isolated
+    // from folder A.
+    let labels = client.completion_labels(&query_uri, 0, 15);
+    assert!(labels.contains(&"posts".to_owned()), "{labels:?}");
+    assert!(!labels.contains(&"users".to_owned()), "{labels:?}");
+
+    // Removing folder A drops its schema from the workspace-wide view too.
+    client.notify(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [{ "uri": file_uri(dir_a.path()), "name": "a" }],
+            }
+        }),
+    );
+    client.wait_for_load();
+
+    let in_a_uri = file_uri(&dir_a.path().join("q.sql"));
+    client.open(&in_a_uri, "SELECT id FROM ");
+    let labels = client.completion_labels(&in_a_uri, 0, 15);
+    assert!(!labels.contains(&"users".to_owned()), "{labels:?}");
+}
+
 #[tokio::test]
 async fn env_changes_pick_up_live_introspection_mid_session() {
     use sqlx::sqlite::SqliteConnectOptions;
