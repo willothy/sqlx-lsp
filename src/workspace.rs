@@ -400,6 +400,11 @@ impl DbContext {
     }
 }
 
+/// How long a live database gets to answer introspection before the load
+/// proceeds without it. Unreachable hosts can otherwise stall a reload for
+/// the operating system's TCP timeout, which is measured in minutes.
+const INTROSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Introspects the database at `url` and merges the result into `schema`,
 /// logging the outcome. Failures are informational: an unreachable database
 /// only means the live layer is missing.
@@ -411,20 +416,30 @@ async fn introspect_into(
     log: &mut LoadLog,
 ) {
     match LiveDatabase::from_url(url, kind, root) {
-        Ok(database) => match database.introspect().await {
-            Ok(tables) => {
-                log.push((
-                    MessageType::INFO,
+        Ok(database) => {
+            match tokio::time::timeout(INTROSPECT_TIMEOUT, database.introspect()).await {
+                Ok(Ok(tables)) => {
+                    log.push((
+                        MessageType::INFO,
+                        format!(
+                            "introspected {} relation(s) from {}",
+                            tables.len(),
+                            database.describe()
+                        ),
+                    ));
+                    schema.merge_database_tables(tables);
+                }
+                Ok(Err(error)) => log.push((MessageType::INFO, error.to_string())),
+                Err(_elapsed) => log.push((
+                    MessageType::WARNING,
                     format!(
-                        "introspected {} relation(s) from {}",
-                        tables.len(),
-                        database.describe()
+                        "introspection of {} timed out after {}s; continuing without it",
+                        database.describe(),
+                        INTROSPECT_TIMEOUT.as_secs()
                     ),
-                ));
-                schema.merge_database_tables(tables);
+                )),
             }
-            Err(error) => log.push((MessageType::INFO, error.to_string())),
-        },
+        }
         Err(error) => log.push((MessageType::INFO, error.to_string())),
     }
 }
