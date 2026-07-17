@@ -47,6 +47,13 @@ use crate::parse::ParsedSql;
 use crate::schema::TableOrigin;
 use crate::workspace::{self, DbContext, Workspace};
 
+/// Whether a saved or watched file can hold queries the workspace index
+/// caches: Rust sources and standalone `.sql` files.
+fn is_query_source(uri: &Uri) -> bool {
+    let path = uri.path().as_str();
+    path.ends_with(".rs") || path.ends_with(".sql")
+}
+
 /// Whether `name` is usable as a bare SQL identifier: a letter or
 /// underscore followed by letters, digits, or underscores.
 fn is_valid_identifier(name: &str) -> bool {
@@ -233,6 +240,9 @@ pub struct ServerState {
     /// Whether the client pulls diagnostics (`textDocument/diagnostic`);
     /// pushes are suppressed then, so documents are not reported twice.
     pull_diagnostics_supported: AtomicBool,
+    /// Wakes the query-index worker. Like reloads, refresh requests
+    /// coalesce: a burst of saves produces one rescan plus one follow-up.
+    query_refresh_notify: Notify,
 }
 
 impl Backend {
@@ -249,6 +259,7 @@ impl Backend {
             next_progress_id: AtomicU64::new(0),
             document_changes_supported: AtomicBool::new(false),
             pull_diagnostics_supported: AtomicBool::new(false),
+            query_refresh_notify: Notify::new(),
         });
 
         // Reloads run here rather than in notification handlers: a slow
@@ -262,11 +273,46 @@ impl Backend {
             }
         });
 
+        // Query-index rescans are much lighter than reloads (no cargo
+        // metadata, no introspection) but still walk the workspace, so they
+        // run on their own coalescing worker.
+        let refresher = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                refresher.query_refresh_notify.notified().await;
+                refresher.refresh_query_documents().await;
+            }
+        });
+
         Backend { state }
     }
 }
 
 impl ServerState {
+    /// Schedules a query-index rescan on its worker and returns
+    /// immediately.
+    fn request_query_refresh(&self) {
+        self.query_refresh_notify.notify_one();
+    }
+
+    /// Rescans the workspace's query sources and swaps the cached index,
+    /// reporting the result the way reloads report theirs.
+    async fn refresh_query_documents(&self) {
+        let (roots, migration_dirs) = {
+            let workspace = self.workspace.read().await;
+            (workspace.roots.clone(), workspace.migration_dirs.clone())
+        };
+        let documents = workspace::QueryDocument::scan(&roots, &migration_dirs);
+        let count = documents.len();
+        self.workspace.write().await.query_documents = documents;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("query index covers {count} file(s)"),
+            )
+            .await;
+    }
+
     /// Schedules a workspace reload on the worker and returns immediately.
     fn request_reload(&self) {
         self.reload_notify.notify_one();
@@ -524,6 +570,34 @@ impl ServerState {
                 locations.push(Location::new(migration.uri.clone(), range));
             }
         }
+
+        for query in &workspace.query_documents {
+            if !query.path().starts_with(&context.root)
+                || open_paths.contains(&workspace::normalize(query.path().to_owned()))
+            {
+                continue;
+            }
+            match query {
+                workspace::QueryDocument::Sql(sql) => {
+                    let parsed = sql.parsed(context.kind);
+                    for range in
+                        resolve::references_to(&sql.document, &parsed, &context.schema, target)
+                    {
+                        locations.push(Location::new(sql.uri.clone(), range));
+                    }
+                }
+                workspace::QueryDocument::Rust(rust) => {
+                    for range in embedded::references_to(
+                        &rust.extracted,
+                        &context.schema,
+                        context.kind,
+                        target,
+                    ) {
+                        locations.push(Location::new(rust.uri.clone(), range));
+                    }
+                }
+            }
+        }
     }
 
     /// The full semantic-token stream for `open` under `kind`.
@@ -615,7 +689,8 @@ impl ServerState {
         }
 
         let mut globs = vec![
-            "**/migrations/**/*.sql".to_owned(),
+            "**/*.rs".to_owned(),
+            "**/*.sql".to_owned(),
             "**/Cargo.toml".to_owned(),
             "**/sqlx.toml".to_owned(),
             "**/.env".to_owned(),
@@ -894,6 +969,8 @@ impl LanguageServer for Backend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         if self.affects_workspace(&params.text_document.uri).await {
             self.request_reload();
+        } else if is_query_source(&params.text_document.uri) {
+            self.request_query_refresh();
         }
     }
 
@@ -1426,11 +1503,18 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // A full reload also rebuilds the query index, so it subsumes any
+        // refresh the same batch would request.
+        let mut refresh_queries = false;
         for change in &params.changes {
             if self.affects_workspace(&change.uri).await {
                 self.request_reload();
                 return;
             }
+            refresh_queries = refresh_queries || is_query_source(&change.uri);
+        }
+        if refresh_queries {
+            self.request_query_refresh();
         }
     }
 }

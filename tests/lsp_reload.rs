@@ -160,17 +160,22 @@ impl LspClient {
     }
 
     /// Blocks until the workspace-load summary log line arrives — the
-    /// deterministic signal that a (re)load finished.
+    /// deterministic signal that a (re)load finished. Anything already
+    /// buffered is drained first, so a previous load's summary can't
+    /// satisfy this wait.
     fn wait_for_load(&mut self) {
-        // Drain anything already buffered so a previous load's summary can't
-        // satisfy this wait.
+        self.wait_for_log("workspace-wide index holds");
+    }
+
+    /// Blocks until a `window/logMessage` containing `needle` arrives.
+    fn wait_for_log(&mut self, needle: &str) {
         loop {
             let message = self.next_message();
-            let is_summary = message["method"] == "window/logMessage"
+            let matches = message["method"] == "window/logMessage"
                 && message["params"]["message"]
                     .as_str()
-                    .is_some_and(|text| text.contains("workspace-wide index holds"));
-            if is_summary {
+                    .is_some_and(|text| text.contains(needle));
+            if matches {
                 return;
             }
         }
@@ -363,6 +368,114 @@ fn schema_changes_reload_while_the_session_is_open() {
     assert!(hover.contains("users.email TEXT NOT NULL"), "{hover}");
     // The definition location tracks the rewritten file.
     assert!(hover.contains("0001_users.sql"), "{hover}");
+}
+
+#[test]
+fn references_and_rename_cover_closed_query_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+    std::fs::create_dir_all(dir.path().join("queries")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let main_rs = dir.path().join("src").join("main.rs");
+    std::fs::write(
+        &main_rs,
+        "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users\");\n}\n",
+    )
+    .expect("write main.rs");
+    std::fs::write(
+        dir.path().join("queries").join("get.sql"),
+        "SELECT id FROM users;",
+    )
+    .expect("write query file");
+    let mut client = LspClient::start(dir.path());
+
+    // Neither main.rs nor get.sql is ever opened.
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "DELETE FROM users");
+
+    let references = |client: &mut LspClient| {
+        client
+            .request(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": query_uri },
+                    "position": { "line": 0, "character": 13 },
+                    "context": { "includeDeclaration": false },
+                }),
+            )
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let locations = references(&mut client);
+    let uris: Vec<&str> = locations
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert!(uris.iter().any(|uri| uri.ends_with("q.sql")), "{uris:?}");
+    assert!(uris.iter().any(|uri| uri.ends_with("main.rs")), "{uris:?}");
+    assert!(uris.iter().any(|uri| uri.ends_with("get.sql")), "{uris:?}");
+    let in_main = locations
+        .iter()
+        .filter(|location| {
+            location["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("main.rs"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(in_main.len(), 1, "{in_main:?}");
+    assert_eq!(in_main[0]["range"]["start"]["line"], 1);
+    assert_eq!(in_main[0]["range"]["start"]["character"], 41);
+
+    // Rename rewrites the closed files too.
+    let edit = client.request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 13 },
+            "newName": "accounts",
+        }),
+    );
+    let changes = edit["changes"].as_object().expect("changes");
+    assert!(
+        changes.keys().any(|uri| uri.ends_with("main.rs")),
+        "{changes:?}"
+    );
+    assert!(
+        changes.keys().any(|uri| uri.ends_with("get.sql")),
+        "{changes:?}"
+    );
+
+    // A new query lands in main.rs (e.g. written by another tool); the
+    // watched-file notification refreshes the index without a full reload.
+    std::fs::write(
+        &main_rs,
+        "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users\");\n    \
+         let _ = sqlx::query!(\"DELETE FROM users\");\n}\n",
+    )
+    .expect("rewrite main.rs");
+    client.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({ "changes": [{ "uri": file_uri(&main_rs), "type": 2 }] }),
+    );
+    client.wait_for_log("query index covers");
+
+    let locations = references(&mut client);
+    let in_main = locations
+        .iter()
+        .filter(|location| {
+            location["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("main.rs"))
+        })
+        .count();
+    assert_eq!(in_main, 2, "{locations:?}");
 }
 
 #[test]

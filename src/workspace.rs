@@ -63,6 +63,91 @@ pub struct Workspace {
     /// Every migration file's contents, read once at load time so reference
     /// searches need no request-time disk access. Reloads rebuild the list.
     pub migration_documents: Vec<SqlDocument>,
+    /// Every query source in the workspace — standalone `.sql` files and
+    /// Rust sources whose macros embed SQL — so reference searches and
+    /// rename cover closed files. Rebuilt on reloads and on query-source
+    /// saves.
+    pub query_documents: Vec<QueryDocument>,
+}
+
+/// A workspace file holding queries outside the migrations.
+#[derive(Debug)]
+pub enum QueryDocument {
+    /// A standalone `.sql` file served as one SQL document.
+    Sql(SqlDocument),
+    /// A Rust source, reduced to its extracted query regions.
+    Rust(RustQueryDocument),
+}
+
+/// The query regions of one Rust source on disk.
+#[derive(Debug)]
+pub struct RustQueryDocument {
+    /// Absolute path of the file.
+    pub path: PathBuf,
+    /// The path as a file URI.
+    pub uri: Uri,
+    /// The extracted SQL regions, in host-document coordinates.
+    pub extracted: embedded::EmbeddedSql,
+}
+
+impl QueryDocument {
+    /// The file's path.
+    pub fn path(&self) -> &Path {
+        match self {
+            QueryDocument::Sql(sql) => &sql.path,
+            QueryDocument::Rust(rust) => &rust.path,
+        }
+    }
+
+    /// Scans the workspace `roots` for query sources: `.sql` files outside
+    /// the migration directories (those are cached separately) and Rust
+    /// sources containing query macros. Unreadable files and Rust sources
+    /// without queries are dropped; the next scan retries them.
+    pub(crate) fn scan(roots: &[PathBuf], migration_dirs: &[PathBuf]) -> Vec<QueryDocument> {
+        let mut documents = Vec::new();
+        let mut seen = BTreeSet::new();
+        for root in roots {
+            for path in query_source_candidates(&normalize(root.clone())) {
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                let is_sql = path.extension().is_some_and(|extension| extension == "sql");
+                if is_sql && migration_dirs.iter().any(|dir| path.starts_with(dir)) {
+                    continue;
+                }
+                let Some(uri) = Uri::from_file_path(&path) else {
+                    continue;
+                };
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if is_sql {
+                    documents.push(QueryDocument::Sql(SqlDocument {
+                        path,
+                        uri,
+                        document: Document::new(text),
+                        parsed: Mutex::new(None),
+                    }));
+                } else {
+                    // Cheap pre-filter before spending a tree-sitter parse.
+                    if !text.contains("query") {
+                        continue;
+                    }
+                    let extracted = embedded::EmbeddedSql::extract(&Document::new(text));
+                    if extracted.regions.is_empty() {
+                        continue;
+                    }
+                    documents.push(QueryDocument::Rust(RustQueryDocument {
+                        path,
+                        uri,
+                        extracted,
+                    }));
+                }
+            }
+        }
+        documents.sort_by(|a, b| a.path().cmp(b.path()));
+        documents
+    }
 }
 
 /// One `.sql` file, read and cached when the workspace loads.
@@ -148,6 +233,7 @@ impl Default for Workspace {
             },
             migration_dirs: Vec::new(),
             migration_documents: Vec::new(),
+            query_documents: Vec::new(),
         }
     }
 }
@@ -221,6 +307,7 @@ impl Workspace {
             ),
         ));
 
+        let query_documents = QueryDocument::scan(&roots, &migration_dirs);
         (
             Workspace {
                 roots,
@@ -232,6 +319,7 @@ impl Workspace {
                     schema: fallback_schema,
                 },
                 migration_documents: SqlDocument::scan(&migration_dirs),
+                query_documents,
                 migration_dirs,
             },
             log,
@@ -668,6 +756,24 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     sources
 }
 
+/// Every `.rs` and `.sql` file under `dir`, walked the way [`rust_sources`]
+/// walks: .gitignore respected, hidden directories and build output
+/// skipped.
+fn query_source_candidates(dir: &Path) -> Vec<PathBuf> {
+    let mut sources: Vec<PathBuf> = ignore::WalkBuilder::new(dir)
+        .filter_entry(|entry| entry.file_name() != "node_modules" && entry.file_name() != "target")
+        .build()
+        .filter_map(|entry| entry.ok())
+        .map(ignore::DirEntry::into_path)
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "rs" || extension == "sql")
+        })
+        .collect();
+    sources.sort();
+    sources
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +784,45 @@ mod tests {
             kind,
             schema: Schema::default(),
         }
+    }
+
+    #[test]
+    fn query_scan_covers_rust_and_sql_sources_outside_migrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::create_dir_all(root.join("queries")).expect("mkdir");
+        std::fs::create_dir_all(root.join("migrations")).expect("mkdir");
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            r#"fn main() { let _ = sqlx::query!("SELECT id FROM users"); }"#,
+        )
+        .expect("write main.rs");
+        std::fs::write(root.join("src").join("lib.rs"), "pub fn f() {}").expect("write lib.rs");
+        std::fs::write(
+            root.join("queries").join("get.sql"),
+            "SELECT id FROM users;",
+        )
+        .expect("write query");
+        std::fs::write(
+            root.join("migrations").join("1_users.sql"),
+            "CREATE TABLE users (id INTEGER);",
+        )
+        .expect("write migration");
+
+        let migration_dirs = vec![normalize(root.join("migrations"))];
+        let documents = QueryDocument::scan(&[root.to_owned()], &migration_dirs);
+        let names: Vec<_> = documents
+            .iter()
+            .filter_map(|document| document.path().file_name())
+            .collect();
+        // The migration is cached separately, and lib.rs has no queries.
+        assert_eq!(names, vec!["get.sql", "main.rs"], "{documents:?}");
+
+        let QueryDocument::Rust(rust) = &documents[1] else {
+            panic!("main.rs is a Rust query source");
+        };
+        assert_eq!(rust.extracted.regions.len(), 1);
     }
 
     #[test]
@@ -693,6 +838,7 @@ mod tests {
             fallback: context(Path::new(""), DatabaseKind::Sqlite),
             migration_dirs: Vec::new(),
             migration_documents: Vec::new(),
+            query_documents: Vec::new(),
         };
         let uri = |path: &str| Uri::from_file_path(path).expect("valid path");
 
