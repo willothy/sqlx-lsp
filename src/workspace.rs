@@ -12,13 +12,16 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::ls_types::{MessageType, Uri};
 
 use crate::config::SqlxConfig;
 use crate::db::{DatabaseKind, Detection, SqlxMember};
+use crate::document::Document;
 use crate::embedded::{self, MigrateSource};
 use crate::introspect::{self, LiveDatabase};
+use crate::parse::ParsedSql;
 use crate::schema::Schema;
 
 /// Log lines produced while loading, forwarded to the LSP client.
@@ -57,6 +60,76 @@ pub struct Workspace {
     /// Every migrations directory the schema indexes were built from, for
     /// save-triggered reloads.
     pub migration_dirs: Vec<PathBuf>,
+    /// Every migration file's contents, read once at load time so reference
+    /// searches need no request-time disk access. Reloads rebuild the list.
+    pub migration_documents: Vec<MigrationDocument>,
+}
+
+/// One migration file, read and cached when the workspace loads.
+#[derive(Debug)]
+pub struct MigrationDocument {
+    /// Absolute path of the file, as scanned from its migrations directory.
+    pub path: PathBuf,
+    /// The path as a file URI.
+    pub uri: Uri,
+    /// The file's contents.
+    pub document: Document,
+    /// The SQL parse of the contents, keyed by the dialect it was parsed
+    /// under (contexts of different backends can share one file through
+    /// merged views).
+    parsed: Mutex<Option<(DatabaseKind, Arc<ParsedSql>)>>,
+}
+
+impl MigrationDocument {
+    /// The parse of the contents under `kind`'s dialect, computed at most
+    /// once per dialect for the lifetime of this workspace load.
+    pub fn parsed(&self, kind: DatabaseKind) -> Arc<ParsedSql> {
+        let mut cache = self.parsed.lock().expect("parse cache lock poisoned");
+        if let Some((cached_kind, parsed)) = &*cache
+            && *cached_kind == kind
+        {
+            return Arc::clone(parsed);
+        }
+        let parsed = Arc::new(ParsedSql::parse(kind.dialect(), self.document.text()));
+        *cache = Some((kind, Arc::clone(&parsed)));
+        parsed
+    }
+
+    /// Reads every `.sql` file under `dirs`, down-migrations included —
+    /// they reference schema objects too. Unreadable files are skipped;
+    /// the next reload retries them.
+    fn scan(dirs: &[PathBuf]) -> Vec<MigrationDocument> {
+        let mut documents = Vec::new();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|extension| extension != "sql") {
+                    continue;
+                }
+                let Ok(path) = std::path::absolute(&path) else {
+                    continue;
+                };
+                let Some(uri) = Uri::from_file_path(&path) else {
+                    continue;
+                };
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                documents.push(MigrationDocument {
+                    path,
+                    uri,
+                    document: Document::new(text),
+                    parsed: Mutex::new(None),
+                });
+            }
+        }
+        documents.sort_by(|a, b| a.path.cmp(&b.path));
+        documents.dedup_by(|a, b| a.path == b.path);
+        documents
+    }
 }
 
 impl Default for Workspace {
@@ -74,6 +147,7 @@ impl Default for Workspace {
                 schema: Schema::default(),
             },
             migration_dirs: Vec::new(),
+            migration_documents: Vec::new(),
         }
     }
 }
@@ -94,31 +168,6 @@ impl Workspace {
         Self::deepest_containing(&self.contexts, &path)
             .or_else(|| Self::deepest_containing(&self.folder_contexts, &path))
             .unwrap_or(&self.fallback)
-    }
-
-    /// The `.sql` files of every indexed migrations directory that serves
-    /// `context`: those under the context root which, for the fallback's
-    /// empty root, is all of them — matching how its schema merges every
-    /// folder. Directories that vanished since the last load are skipped;
-    /// the next reload drops them.
-    pub fn migration_files_for(&self, context: &DbContext) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-        for dir in &self.migration_dirs {
-            if !dir.starts_with(&context.root) {
-                continue;
-            }
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|extension| extension == "sql") {
-                    files.push(path);
-                }
-            }
-        }
-        files.sort();
-        files
     }
 
     /// The deepest context whose root contains `path`, if any.
@@ -182,6 +231,7 @@ impl Workspace {
                     kind: fallback_kind,
                     schema: fallback_schema,
                 },
+                migration_documents: MigrationDocument::scan(&migration_dirs),
                 migration_dirs,
             },
             log,
@@ -642,6 +692,7 @@ mod tests {
             folder_contexts: vec![context(Path::new("/repo"), DatabaseKind::MySql)],
             fallback: context(Path::new(""), DatabaseKind::Sqlite),
             migration_dirs: Vec::new(),
+            migration_documents: Vec::new(),
         };
         let uri = |path: &str| Uri::from_file_path(path).expect("valid path");
 

@@ -488,25 +488,17 @@ impl ServerState {
             }
         }
 
-        for path in workspace.migration_files_for(context) {
-            if open_paths.contains(&workspace::normalize(path.clone())) {
+        for migration in &workspace.migration_documents {
+            if !migration.path.starts_with(&context.root)
+                || open_paths.contains(&workspace::normalize(migration.path.clone()))
+            {
                 continue;
             }
-            // Absolutize the same way the schema records definition
-            // locations, so the resulting URIs compare equal to them.
-            let Ok(path) = std::path::absolute(&path) else {
-                continue;
-            };
-            let Some(file_uri) = Uri::from_file_path(&path) else {
-                continue;
-            };
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let document = Document::new(text);
-            let parsed = ParsedSql::parse(context.kind.dialect(), document.text());
-            for range in resolve::references_to(&document, &parsed, &context.schema, target) {
-                locations.push(Location::new(file_uri.clone(), range));
+            let parsed = migration.parsed(context.kind);
+            for range in
+                resolve::references_to(&migration.document, &parsed, &context.schema, target)
+            {
+                locations.push(Location::new(migration.uri.clone(), range));
             }
         }
     }
