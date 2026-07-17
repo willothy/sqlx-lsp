@@ -177,11 +177,17 @@ impl LspClient {
     }
 
     fn open(&mut self, uri: &str, text: &str) {
+        self.open_as(uri, "sql", text);
+    }
+
+    /// Opens a document under an explicit language id (e.g. `rust` for
+    /// buffers whose sqlx macros embed SQL).
+    fn open_as(&mut self, uri: &str, language_id: &str, text: &str) {
         self.notify(
             "textDocument/didOpen",
             json!({
                 "textDocument": {
-                    "uri": uri, "languageId": "sql", "version": 1, "text": text,
+                    "uri": uri, "languageId": language_id, "version": 1, "text": text,
                 }
             }),
         );
@@ -454,6 +460,74 @@ fn goto_definition_resolves_into_migration_files() {
     );
     assert_eq!(location["range"]["start"]["line"], 1, "{location:?}");
     assert_eq!(location["range"]["start"]["character"], 2, "{location:?}");
+}
+
+#[test]
+fn rust_buffers_serve_sql_inside_query_macros() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let main_uri = file_uri(&dir.path().join("src").join("main.rs"));
+    // The SQL string spans host columns 26..46 on line 1.
+    let source = "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users\");\n}\n";
+    client.open_as(&main_uri, "rust", source);
+    let diagnostics = client.wait_for_diagnostics(&main_uri);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+    // Hover on `users` inside the macro string shows the table definition.
+    let hover = client.hover_text(&main_uri, 1, 43);
+    assert!(hover.contains("CREATE TABLE users"), "{hover}");
+
+    // Completion after `FROM ` offers the schema's tables.
+    let labels = client.completion_labels(&main_uri, 1, 41);
+    assert!(labels.contains(&"users".to_owned()), "{labels:?}");
+
+    // Goto definition escapes the Rust buffer into the migration file.
+    let location = client.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 1, "character": 43 },
+        }),
+    );
+    assert!(
+        location["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("1_users.sql")),
+        "{location:?}"
+    );
+
+    // The embedded SQL produces semantic tokens.
+    let tokens = client.request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": main_uri } }),
+    );
+    assert!(
+        tokens["data"]
+            .as_array()
+            .is_some_and(|data| !data.is_empty()),
+        "{tokens:?}"
+    );
+
+    // An unknown table inside the macro is flagged at host coordinates.
+    let source = "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM posts\");\n}\n";
+    client.change(&main_uri, 2, source);
+    let diagnostics = client.wait_for_diagnostics(&main_uri);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0]["range"]["start"]["line"], 1,
+        "{diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics[0]["range"]["start"]["character"], 41,
+        "{diagnostics:?}"
+    );
 }
 
 #[test]
