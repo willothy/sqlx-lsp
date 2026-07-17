@@ -14,7 +14,7 @@ use tower_lsp_server::ls_types::{
 };
 use tree_sitter::{Node, Parser};
 
-use crate::analysis::resolve::ReferenceTarget;
+use crate::analysis::resolve::{ReferenceTarget, Resolved};
 use crate::analysis::semantic_tokens;
 use crate::db::DatabaseKind;
 use crate::document::{AppliedEdit, Document};
@@ -365,6 +365,40 @@ pub fn diagnostics(embedded: &EmbeddedSql, schema: &Schema, kind: DatabaseKind) 
         }
     }
     all
+}
+
+/// Resolves the schema reference at `position` inside an SQL region, with
+/// the reference range mapped to host coordinates.
+pub fn resolve_at(
+    embedded: &EmbeddedSql,
+    position: Position,
+    schema: &Schema,
+    kind: DatabaseKind,
+) -> Option<Resolved> {
+    let region = embedded.region_at(position)?;
+    let sql_document = Document::new(region.text.clone());
+    let parsed = ParsedSql::parse(kind.dialect(), sql_document.text());
+    let resolved = crate::analysis::resolve::resolve_at(
+        &sql_document,
+        &parsed,
+        region.to_embedded(position),
+        schema,
+    )?;
+    Some(match resolved {
+        Resolved::Table { table, range } => Resolved::Table {
+            table,
+            range: region.to_host_range(range),
+        },
+        Resolved::Column {
+            table,
+            column,
+            range,
+        } => Resolved::Column {
+            table,
+            column,
+            range: region.to_host_range(range),
+        },
+    })
 }
 
 /// The reference target named at `position`, together with every range in

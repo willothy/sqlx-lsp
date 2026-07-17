@@ -8,29 +8,43 @@ use tower_lsp_server::ls_types::{
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, Location, MessageType, OneOf, Position, ProgressToken,
-    Range, ReferenceParams, Registration, SemanticToken, SemanticTokens, SemanticTokensDelta,
-    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensFullOptions,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Unregistration, Uri,
-    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    InitializeResult, InitializedParams, Location, MessageType, OneOf, Position,
+    PrepareRenameResponse, ProgressToken, Range, ReferenceParams, Registration, RenameOptions,
+    RenameParams, SemanticToken, SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Unregistration, Uri,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::analysis::resolve::{self, ReferenceTarget};
+use crate::analysis::resolve::{self, ReferenceTarget, Resolved};
 use crate::analysis::{completion, definition, diagnostics, hover, semantic_tokens};
 use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::embedded::{self, EmbeddedSql};
 use crate::parse::ParsedSql;
+use crate::schema::TableOrigin;
 use crate::workspace::{self, DbContext, Workspace};
+
+/// Whether `name` is usable as a bare SQL identifier: a letter or
+/// underscore followed by letters, digits, or underscores.
+fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
 /// How an open document is served: as a SQL file, or as a Rust file whose
 /// sqlx query macros embed SQL.
@@ -348,6 +362,40 @@ impl ServerState {
         Some((target, locations))
     }
 
+    /// Resolves the schema reference at `position` for a rename request,
+    /// with its range in host coordinates.
+    async fn resolve_for_rename(&self, uri: &Uri, position: Position) -> Option<Resolved> {
+        let workspace = self.workspace.read().await;
+        let context = workspace.context_for(uri);
+        let open = self.documents.get(uri)?;
+        match open.language {
+            DocumentLanguage::Sql => {
+                let parsed = open.parsed(context.kind);
+                resolve::resolve_at(&open.document, &parsed, position, &context.schema)
+            }
+            DocumentLanguage::Rust => {
+                let extracted = open.extracted();
+                embedded::resolve_at(&extracted, position, &context.schema, context.kind)
+            }
+        }
+    }
+
+    /// Whether the resolved object can be renamed: its definition must live
+    /// in workspace sources. Renaming an object known only from live-
+    /// database introspection would rewrite queries against a relation the
+    /// database still knows by its old name. `Err` carries the reason shown
+    /// to the user.
+    fn renameable(resolved: &Resolved) -> Result<(), String> {
+        let (Resolved::Table { table, .. } | Resolved::Column { table, .. }) = resolved;
+        match table.origin {
+            TableOrigin::Database => Err(format!(
+                "cannot rename `{}`: it is defined only in the live database",
+                table.name
+            )),
+            TableOrigin::Migration | TableOrigin::Query => Ok(()),
+        }
+    }
+
     /// Extends `locations` with references to `target` found in every other
     /// open document served by `context` and in the context's migration
     /// files on disk. Migration files that are open are skipped — their
@@ -633,6 +681,10 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_owned()]),
                     ..CompletionOptions::default()
@@ -815,6 +867,60 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         Ok(Some(locations))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> jsonrpc::Result<Option<PrepareRenameResponse>> {
+        let Some(resolved) = self
+            .resolve_for_rename(&params.text_document.uri, params.position)
+            .await
+        else {
+            return Ok(None);
+        };
+        if let Err(message) = ServerState::renameable(&resolved) {
+            return Err(jsonrpc::Error::invalid_params(message));
+        }
+        let (Resolved::Table { range, .. } | Resolved::Column { range, .. }) = resolved;
+        Ok(Some(PrepareRenameResponse::Range(range)))
+    }
+
+    async fn rename(&self, params: RenameParams) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        if !is_valid_identifier(&params.new_name) {
+            return Err(jsonrpc::Error::invalid_params(format!(
+                "`{}` is not a valid identifier",
+                params.new_name
+            )));
+        }
+        let Some(resolved) = self.resolve_for_rename(&uri, position).await else {
+            return Ok(None);
+        };
+        if let Err(message) = ServerState::renameable(&resolved) {
+            return Err(jsonrpc::Error::invalid_params(message));
+        }
+
+        // The edit set is the full reference set, declaration included —
+        // renaming must touch the defining identifier.
+        let Some((_, locations)) = self.reference_locations(&uri, position, true).await else {
+            return Ok(None);
+        };
+        if locations.is_empty() {
+            return Ok(None);
+        }
+        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        for location in locations {
+            changes.entry(location.uri).or_default().push(TextEdit {
+                range: location.range,
+                new_text: params.new_name.clone(),
+            });
+        }
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..WorkspaceEdit::default()
+        }))
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {

@@ -588,6 +588,105 @@ fn references_span_open_documents_and_migrations() {
 }
 
 #[test]
+fn rename_rewrites_references_across_documents_and_migrations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM users");
+
+    // prepareRename highlights the identifier under the cursor.
+    let prepared = client.request(
+        "textDocument/prepareRename",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 17 },
+        }),
+    );
+    assert_eq!(prepared["start"]["character"], 15, "{prepared:?}");
+    assert_eq!(prepared["end"]["character"], 20, "{prepared:?}");
+
+    // The rename edits both the query and the migration's CREATE TABLE.
+    let edit = client.request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 17 },
+            "newName": "accounts",
+        }),
+    );
+    let changes = edit["changes"].as_object().expect("changes map");
+    assert_eq!(changes.len(), 2, "{changes:?}");
+
+    let query_edits = changes[&query_uri].as_array().expect("query edits");
+    assert_eq!(query_edits.len(), 1, "{query_edits:?}");
+    assert_eq!(query_edits[0]["range"]["start"]["character"], 15);
+    assert_eq!(query_edits[0]["newText"], "accounts");
+
+    let (migration_uri, migration_edits) = changes
+        .iter()
+        .find(|(uri, _)| uri.ends_with("1_users.sql"))
+        .expect("migration edits");
+    let migration_edits = migration_edits.as_array().expect("array");
+    assert_eq!(migration_edits.len(), 1, "{migration_uri}");
+    assert_eq!(migration_edits[0]["range"]["start"]["character"], 13);
+    assert_eq!(migration_edits[0]["newText"], "accounts");
+
+    // An invalid identifier is rejected rather than applied.
+    let rejected = client.request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 17 },
+            "newName": "1bad name",
+        }),
+    );
+    assert!(rejected.is_null(), "{rejected:?}");
+}
+
+#[test]
+fn rename_of_query_local_relations_stays_in_the_document() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(
+        &query_uri,
+        "WITH r AS (SELECT id FROM users) SELECT id FROM r",
+    );
+
+    // Renaming the CTE touches only its definition and use in this file.
+    let edit = client.request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 5 },
+            "newName": "recent",
+        }),
+    );
+    let changes = edit["changes"].as_object().expect("changes map");
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    let edits = changes[&query_uri].as_array().expect("edits");
+    let starts: Vec<_> = edits
+        .iter()
+        .map(|edit| edit["range"]["start"]["character"].as_u64())
+        .collect();
+    assert_eq!(starts, vec![Some(5), Some(48)], "{edits:?}");
+}
+
+#[test]
 fn reloads_report_work_done_progress() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut client = LspClient::start_with_capabilities(
