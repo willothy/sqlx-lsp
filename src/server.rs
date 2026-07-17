@@ -132,8 +132,9 @@ pub struct ServerState {
     client: Client,
     documents: DashMap<Uri, OpenDocument>,
     workspace: RwLock<Workspace>,
-    /// Set once the client rejects dynamic watcher registration, so reloads
-    /// stop retrying (the did_save fallback covers those clients).
+    /// Set when the client does not support dynamic watcher registration
+    /// (or rejected one), so reloads stop attempting it; the did_save
+    /// fallback covers those clients.
     watchers_unavailable: AtomicBool,
     /// Wakes the reload worker. Requests coalesce: any number of triggers
     /// while a reload runs result in exactly one follow-up reload.
@@ -301,6 +302,19 @@ impl LanguageServer for Backend {
             roots.push(path.into_owned());
         }
         self.workspace.write().await.roots = roots;
+
+        // A server must not register capabilities dynamically unless the
+        // client opted in; without the opt-in the did_save fallback keeps
+        // the schema index fresh instead.
+        let watched_files_registration = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+            .and_then(|capability| capability.dynamic_registration)
+            .unwrap_or(false);
+        self.watchers_unavailable
+            .store(!watched_files_registration, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
