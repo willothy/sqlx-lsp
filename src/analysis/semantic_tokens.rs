@@ -355,7 +355,7 @@ pub fn segments(document: &Document, parsed: &ParsedSql) -> Vec<TokenSegment> {
             let end = if line == range.end.line {
                 range.end.character
             } else {
-                document.line_utf16_len(line)
+                document.line_len(line)
             };
             if end > start {
                 segments.push(TokenSegment {

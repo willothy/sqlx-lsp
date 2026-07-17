@@ -17,8 +17,8 @@ use tower_lsp_server::ls_types::{
     FullDocumentDiagnosticReport, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
     Location, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
-    PrepareRenameResponse, ProgressToken, Range, ReferenceParams, Registration,
-    RelatedFullDocumentDiagnosticReport, RenameOptions, RenameParams, SemanticToken,
+    PositionEncodingKind, PrepareRenameResponse, ProgressToken, Range, ReferenceParams,
+    Registration, RelatedFullDocumentDiagnosticReport, RenameOptions, RenameParams, SemanticToken,
     SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
@@ -41,7 +41,7 @@ use crate::analysis::{
     actions, completion, definition, diagnostics, hover, semantic_tokens, symbols,
 };
 use crate::db::DatabaseKind;
-use crate::document::Document;
+use crate::document::{self, Document};
 use crate::embedded::{self, EmbeddedSql};
 use crate::parse::ParsedSql;
 use crate::schema::TableOrigin;
@@ -750,8 +750,28 @@ impl LanguageServer for Backend {
         self.pull_diagnostics_supported
             .store(pull_diagnostics_supported, Ordering::Relaxed);
 
+        // Prefer UTF-8 positions when the client offers them (no conversion
+        // work on either side for UTF-8-native editors); UTF-16 is the
+        // protocol's mandatory fallback.
+        let utf8_positions = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|general| general.position_encodings.as_ref())
+            .is_some_and(|encodings| encodings.contains(&PositionEncodingKind::UTF8));
+        document::set_position_encoding(if utf8_positions {
+            document::PositionEncoding::Utf8
+        } else {
+            document::PositionEncoding::Utf16
+        });
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding: Some(if utf8_positions {
+                    PositionEncodingKind::UTF8
+                } else {
+                    PositionEncodingKind::UTF16
+                }),
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),

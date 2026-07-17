@@ -1,13 +1,44 @@
 //! In-memory text documents with position conversions.
 //!
 //! Three coordinate systems meet here: LSP positions are 0-based
-//! `(line, UTF-16 code unit)` pairs, Rust string offsets are UTF-8 bytes, and
+//! `(line, character)` pairs counted in the session's negotiated encoding
+//! (UTF-16 code units by default), Rust string offsets are UTF-8 bytes, and
 //! sqlparser locations are 1-based `(line, column)` pairs counted in Unicode
 //! scalar values. [`Document`] owns the text of one open file and converts
 //! between all three.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use sqlparser::tokenizer::{Location as SqlLocation, Span as SqlSpan};
 use tower_lsp_server::ls_types::{Position, Range};
+
+/// How `Position.character` counts columns within a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionEncoding {
+    /// UTF-16 code units — the protocol's mandatory default.
+    Utf16,
+    /// UTF-8 bytes, negotiated with clients that prefer it.
+    Utf8,
+}
+
+/// Whether positions count UTF-8 bytes. Session-wide: the process serves a
+/// single client, and the encoding is fixed at `initialize`, before any
+/// document conversion runs.
+static UTF8_POSITIONS: AtomicBool = AtomicBool::new(false);
+
+/// Fixes the session's position encoding. Called once during `initialize`.
+pub fn set_position_encoding(encoding: PositionEncoding) {
+    UTF8_POSITIONS.store(encoding == PositionEncoding::Utf8, Ordering::Relaxed);
+}
+
+/// The `Position.character` width of `ch` under the session encoding.
+fn encoded_len(ch: char) -> u32 {
+    if UTF8_POSITIONS.load(Ordering::Relaxed) {
+        ch.len_utf8() as u32
+    } else {
+        ch.len_utf16() as u32
+    }
+}
 
 /// The byte-level shape of one applied content change, in the coordinates
 /// incremental reparsers (tree-sitter) consume: byte offsets plus 0-based
@@ -120,12 +151,12 @@ impl Document {
         };
         let line_text = &self.text[line_start..line_end];
 
-        let mut utf16_offset = 0u32;
+        let mut character_offset = 0u32;
         for (byte_offset, ch) in line_text.char_indices() {
-            if utf16_offset >= position.character {
+            if character_offset >= position.character {
                 return line_start + byte_offset;
             }
-            utf16_offset += ch.len_utf16() as u32;
+            character_offset += encoded_len(ch);
         }
         line_end
     }
@@ -145,16 +176,16 @@ impl Document {
         let line_text = &self.text[line_start..line_end];
 
         let target_chars = (location.column - 1) as usize;
-        let mut utf16_offset = 0u32;
+        let mut character_offset = 0u32;
         for (chars_seen, ch) in line_text.chars().enumerate() {
             if chars_seen == target_chars {
                 break;
             }
-            utf16_offset += ch.len_utf16() as u32;
+            character_offset += encoded_len(ch);
         }
         Some(Position {
             line: line as u32,
-            character: utf16_offset,
+            character: character_offset,
         })
     }
 
@@ -182,7 +213,7 @@ impl Document {
             if line_start + byte >= offset {
                 break;
             }
-            character += ch.len_utf16() as u32;
+            character += encoded_len(ch);
         }
         Position {
             line: line as u32,
@@ -190,16 +221,14 @@ impl Document {
         }
     }
 
-    /// The UTF-16 length of a 0-based line, excluding its trailing newline.
-    /// Returns 0 for lines past the end of the document.
-    pub fn line_utf16_len(&self, line: u32) -> u32 {
+    /// The length of a 0-based line in the session's position encoding,
+    /// excluding its trailing newline. Returns 0 for lines past the end of
+    /// the document.
+    pub fn line_len(&self, line: u32) -> u32 {
         let Some((start, end)) = self.line_span(line as usize) else {
             return 0;
         };
-        self.text[start..end]
-            .chars()
-            .map(|ch| ch.len_utf16() as u32)
-            .sum()
+        self.text[start..end].chars().map(encoded_len).sum()
     }
 
     /// Whether the LSP `position` falls inside the sqlparser `span`

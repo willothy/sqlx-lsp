@@ -678,6 +678,43 @@ fn workspace_symbols_search_the_schema_index() {
 }
 
 #[test]
+fn utf8_position_encoding_negotiates_and_counts_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+
+    let mut client = LspClient::start_with_capabilities(
+        dir.path(),
+        json!({ "general": { "positionEncodings": ["utf-8", "utf-16"] } }),
+    );
+    client.wait_for_load();
+
+    // '😀' is 4 UTF-8 bytes (2 UTF-16 units): in UTF-8 counting, `id`
+    // spans columns 15..17; UTF-16 counting would place it at 13..15.
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT '😀', id FROM users");
+    let response = client.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 16 },
+        }),
+    );
+    assert!(
+        response["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("users.id")),
+        "{response:?}"
+    );
+    assert_eq!(response["range"]["start"]["character"], 15, "{response:?}");
+    assert_eq!(response["range"]["end"]["character"], 17, "{response:?}");
+}
+
+#[test]
 fn pull_diagnostics_report_the_current_document_state() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
