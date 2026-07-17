@@ -605,6 +605,35 @@ fn references_span_open_documents_and_migrations() {
 }
 
 #[test]
+fn document_highlight_marks_occurrences_in_the_requesting_document() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM users; SELECT id FROM users");
+
+    let highlights = client.request(
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 17 },
+        }),
+    );
+    let highlights = highlights.as_array().expect("highlights");
+    let starts: Vec<_> = highlights
+        .iter()
+        .map(|highlight| highlight["range"]["start"]["character"].as_u64())
+        .collect();
+    assert_eq!(starts, vec![Some(15), Some(37)], "{highlights:?}");
+}
+
+#[test]
 fn rename_rewrites_references_across_documents_and_migrations() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");

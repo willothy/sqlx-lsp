@@ -6,18 +6,18 @@ use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, Location, MessageType, OneOf, Position,
-    PrepareRenameResponse, ProgressToken, Range, ReferenceParams, Registration, RenameOptions,
-    RenameParams, SemanticToken, SemanticTokens, SemanticTokensDelta, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Unregistration, Uri,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities,
+    DidSaveTextDocumentParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, MessageType, OneOf, Position, PrepareRenameResponse, ProgressToken, Range,
+    ReferenceParams, Registration, RenameOptions, RenameParams, SemanticToken, SemanticTokens,
+    SemanticTokensDelta, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Unregistration, Uri, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
@@ -288,30 +288,7 @@ impl ServerState {
     ) -> Option<(ReferenceTarget, Vec<Location>)> {
         let workspace = self.workspace.read().await;
         let context = workspace.context_for(uri);
-
-        // The target under the cursor and the requesting document's own
-        // matching ranges.
-        let (target, own_ranges) = {
-            let open = self.documents.get(uri)?;
-            match open.language {
-                DocumentLanguage::Sql => {
-                    let parsed = open.parsed(context.kind);
-                    let target = resolve::reference_target(
-                        &open.document,
-                        &parsed,
-                        position,
-                        &context.schema,
-                    )?;
-                    let ranges =
-                        resolve::references_to(&open.document, &parsed, &context.schema, &target);
-                    (target, ranges)
-                }
-                DocumentLanguage::Rust => {
-                    let extracted = open.extracted();
-                    embedded::references_at(&extracted, position, &context.schema, context.kind)?
-                }
-            }
-        };
+        let (target, own_ranges) = self.own_references(uri, position, context)?;
 
         let mut locations: Vec<Location> = own_ranges
             .into_iter()
@@ -360,6 +337,31 @@ impl ServerState {
         locations.dedup();
 
         Some((target, locations))
+    }
+
+    /// The reference target at `position` in `uri` and the requesting
+    /// document's own matching ranges, in host coordinates.
+    fn own_references(
+        &self,
+        uri: &Uri,
+        position: Position,
+        context: &DbContext,
+    ) -> Option<(ReferenceTarget, Vec<Range>)> {
+        let open = self.documents.get(uri)?;
+        match open.language {
+            DocumentLanguage::Sql => {
+                let parsed = open.parsed(context.kind);
+                let target =
+                    resolve::reference_target(&open.document, &parsed, position, &context.schema)?;
+                let ranges =
+                    resolve::references_to(&open.document, &parsed, &context.schema, &target);
+                Some((target, ranges))
+            }
+            DocumentLanguage::Rust => {
+                let extracted = open.extracted();
+                embedded::references_at(&extracted, position, &context.schema, context.kind)
+            }
+        }
     }
 
     /// Resolves the schema reference at `position` for a rename request,
@@ -681,6 +683,7 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -867,6 +870,31 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         Ok(Some(locations))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> jsonrpc::Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let workspace = self.workspace.read().await;
+        let context = workspace.context_for(&uri);
+        let Some((_, ranges)) = self.own_references(&uri, position, context) else {
+            return Ok(None);
+        };
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            ranges
+                .into_iter()
+                .map(|range| DocumentHighlight {
+                    range,
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect(),
+        ))
     }
 
     async fn prepare_rename(
