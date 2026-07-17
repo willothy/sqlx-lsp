@@ -97,14 +97,11 @@ impl ParsedSql {
             };
             if text == "?" {
                 position += 1;
-            } else if let Some(index) = text
-                .strip_prefix('?')
-                .or_else(|| text.strip_prefix('$'))
-                .and_then(|rest| rest.parse::<usize>().ok())
-            {
-                position = index;
             } else {
-                return None;
+                position = text
+                    .strip_prefix('?')
+                    .or_else(|| text.strip_prefix('$'))
+                    .and_then(|rest| rest.parse::<usize>().ok())?;
             }
             required = required.max(position);
         }
