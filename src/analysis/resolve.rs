@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, AssignmentTarget, Expr, Ident, ObjectName, Statement, TableFactor,
+    AlterTableOperation, AssignmentTarget, Expr, Ident, ObjectName, Query, Statement, TableFactor,
     TableObject, Visit, Visitor,
 };
 use sqlparser::tokenizer::Span;
@@ -88,7 +88,6 @@ impl<'s> References<'s> {
             references.current = index;
             references.scopes.push(BTreeMap::new());
             references.locals.push(Vec::new());
-            references.record_ctes(statement);
             let _ = statement.visit(&mut references);
         }
         references
@@ -118,11 +117,13 @@ impl<'s> References<'s> {
         });
     }
 
-    /// The common table expressions of a top-level query statement.
-    fn record_ctes(&mut self, statement: &Statement) {
-        let Statement::Query(query) = statement else {
-            return;
-        };
+    /// The common table expressions of one query node. Called for every
+    /// query the statement contains — the top level, subqueries, and DML
+    /// sources — so `WITH` works wherever the dialect allows it. The CTEs
+    /// join the flat per-statement scope, an over-approximation of their
+    /// true (query-local) visibility that the scope model shares with
+    /// aliases.
+    fn record_query_ctes(&mut self, query: &Query) {
         let Some(with) = &query.with else {
             return;
         };
@@ -336,6 +337,11 @@ impl Visitor for References<'_> {
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
         self.record_column_defs(statement);
         self.record_assignment_targets(statement);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        self.record_query_ctes(query);
         ControlFlow::Continue(())
     }
 
@@ -767,6 +773,23 @@ mod tests {
         assert_eq!(resolve(sql, 0, 60).as_deref(), Some("column:recent.title"));
         // The definition site itself is hoverable.
         assert_eq!(resolve(sql, 0, 6).as_deref(), Some("table:recent"));
+    }
+
+    #[test]
+    fn resolves_ctes_on_dml_statements() {
+        // sqlite and postgres allow WITH over INSERT; the CTE feeds the
+        // insert source.
+        let sql = "WITH fresh AS (SELECT id FROM users) INSERT INTO posts (author_id) SELECT id FROM fresh";
+        assert_eq!(resolve(sql, 0, 6).as_deref(), Some("table:fresh"));
+        assert_eq!(resolve(sql, 0, 85).as_deref(), Some("table:fresh"));
+    }
+
+    #[test]
+    fn resolves_ctes_inside_subqueries() {
+        let sql =
+            "SELECT sub.id FROM (WITH recent AS (SELECT id FROM posts) SELECT id FROM recent) sub";
+        assert_eq!(resolve(sql, 0, 27).as_deref(), Some("table:recent"));
+        assert_eq!(resolve(sql, 0, 76).as_deref(), Some("table:recent"));
     }
 
     #[test]
