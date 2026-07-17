@@ -414,6 +414,49 @@ fn diagnostics_flag_syntax_errors_and_unknown_references() {
 }
 
 #[test]
+fn goto_definition_resolves_into_migration_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (\n  id INTEGER PRIMARY KEY\n);",
+    )
+    .expect("write migration");
+    let mut client = LspClient::start(dir.path());
+
+    let query_uri = file_uri(&dir.path().join("q.sql"));
+    client.open(&query_uri, "SELECT id FROM users");
+
+    // The table reference jumps to the CREATE TABLE identifier.
+    let location = client.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 17 },
+        }),
+    );
+    assert!(
+        location["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("1_users.sql")),
+        "{location:?}"
+    );
+    assert_eq!(location["range"]["start"]["line"], 0, "{location:?}");
+    assert_eq!(location["range"]["start"]["character"], 13, "{location:?}");
+
+    // The column reference jumps to its own defining line.
+    let location = client.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": query_uri },
+            "position": { "line": 0, "character": 8 },
+        }),
+    );
+    assert_eq!(location["range"]["start"]["line"], 1, "{location:?}");
+    assert_eq!(location["range"]["start"]["character"], 2, "{location:?}");
+}
+
+#[test]
 fn references_span_open_documents_and_migrations() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
