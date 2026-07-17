@@ -116,14 +116,20 @@ impl LspClient {
     /// The next client-bound message, transparently answering server-to-
     /// client requests (e.g. `client/registerCapability`).
     fn next_message(&mut self) -> Value {
+        match self.pending.pop_front() {
+            Some(message) => message,
+            None => self.recv_message(),
+        }
+    }
+
+    /// The next message straight off the wire, bypassing `pending`,
+    /// transparently answering server-to-client requests.
+    fn recv_message(&mut self) -> Value {
         loop {
-            let message = match self.pending.pop_front() {
-                Some(message) => message,
-                None => self
-                    .messages
-                    .recv_timeout(MESSAGE_TIMEOUT)
-                    .expect("server message before timeout"),
-            };
+            let message = self
+                .messages
+                .recv_timeout(MESSAGE_TIMEOUT)
+                .expect("server message before timeout");
             if message.get("method").is_some() && message.get("id").is_some() {
                 let id = message["id"].clone();
                 self.send_raw(json!({ "jsonrpc": "2.0", "id": id, "result": null }));
@@ -137,8 +143,11 @@ impl LspClient {
         self.next_id += 1;
         let id = self.next_id;
         self.send_raw(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        // Read from the wire, not `next_message`: notifications that arrive
+        // ahead of the response are deferred to `pending`, and popping them
+        // back here would cycle forever without ever reaching the response.
         loop {
-            let message = self.next_message();
+            let message = self.recv_message();
             if message.get("id").and_then(Value::as_i64) == Some(id) {
                 return message["result"].clone();
             }
