@@ -362,18 +362,21 @@ impl ServerState {
         self.reload_notify.notify_one();
     }
 
-    /// Computes and publishes diagnostics for one open document.
+    /// Computes and publishes diagnostics for one open document, stamped
+    /// with the document version the computation saw. The reload worker's
+    /// sweep races document changes, so a stale report can be sent after a
+    /// fresh one; the version lets clients keep the newest.
     async fn publish_diagnostics_for(&self, uri: &Uri) {
         // Clients that pull diagnostics must not also receive pushes for
         // the same documents.
         if self.pull_diagnostics_supported.load(Ordering::Relaxed) {
             return;
         }
-        let Some(diagnostics) = self.diagnostics_for(uri).await else {
+        let Some((diagnostics, version)) = self.diagnostics_for(uri).await else {
             return;
         };
         self.client
-            .publish_diagnostics(uri.clone(), diagnostics, None)
+            .publish_diagnostics(uri.clone(), diagnostics, Some(version))
             .await;
     }
 
@@ -454,11 +457,11 @@ impl ServerState {
     }
 
     /// The current diagnostics for `uri`, or `None` when it is not open.
-    async fn diagnostics_for(&self, uri: &Uri) -> Option<Vec<Diagnostic>> {
+    async fn diagnostics_for(&self, uri: &Uri) -> Option<(Vec<Diagnostic>, i32)> {
         let open = self.documents.get(uri)?;
         let workspace = self.workspace.read().await;
         let context = workspace.context_for(uri);
-        Some(match open.language {
+        let diagnostics = match open.language {
             DocumentLanguage::Sql => {
                 let parsed = open.parsed(context.kind);
                 diagnostics::diagnostics(&open.document, &parsed, &context.schema)
@@ -467,7 +470,8 @@ impl ServerState {
                 let extracted = open.extracted();
                 embedded::diagnostics(&extracted, &context.schema, context.kind)
             }
-        })
+        };
+        Some((diagnostics, open.version))
     }
 
     /// Republishes diagnostics for every open document, after the schema
@@ -1282,6 +1286,7 @@ impl LanguageServer for Backend {
         let items = self
             .diagnostics_for(&params.text_document.uri)
             .await
+            .map(|(diagnostics, _)| diagnostics)
             .unwrap_or_default();
         Ok(DocumentDiagnosticReportResult::Report(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
@@ -1316,15 +1321,16 @@ impl LanguageServer for Backend {
         }
         // Open buffers report their live contents, with versions so the
         // client can drop reports that raced an edit.
-        let open_uris: Vec<(Uri, i64)> = self
+        let open_uris: Vec<Uri> = self
             .documents
             .iter()
-            .map(|entry| (entry.key().clone(), i64::from(entry.version)))
+            .map(|entry| entry.key().clone())
             .collect();
-        for (uri, version) in open_uris {
-            let Some(diagnostics) = self.diagnostics_for(&uri).await else {
+        for uri in open_uris {
+            let Some((diagnostics, version)) = self.diagnostics_for(&uri).await else {
                 continue;
             };
+            let version = i64::from(version);
             if diagnostics.is_empty() {
                 continue;
             }

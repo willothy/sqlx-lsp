@@ -252,13 +252,16 @@ impl LspClient {
             .unwrap_or_default()
     }
 
-    /// Blocks until a `publishDiagnostics` notification for `uri` arrives
-    /// and returns its diagnostics array.
-    fn wait_for_diagnostics(&mut self, uri: &str) -> Vec<Value> {
+    /// Blocks until a `publishDiagnostics` notification for `uri` stamped
+    /// with `version` arrives and returns its diagnostics array. Matching
+    /// on the version skips reports the reload worker computed from an
+    /// older buffer state.
+    fn wait_for_diagnostics(&mut self, uri: &str, version: i64) -> Vec<Value> {
         loop {
             let message = self.next_message();
             if message["method"] == "textDocument/publishDiagnostics"
                 && message["params"]["uri"] == uri
+                && message["params"]["version"] == version
             {
                 return message["params"]["diagnostics"]
                     .as_array()
@@ -600,7 +603,7 @@ fn diagnostics_flag_syntax_errors_and_unknown_references() {
     // An unknown table is a warning.
     let query_uri = file_uri(&dir.path().join("q.sql"));
     client.open(&query_uri, "SELECT id FROM posts");
-    let diagnostics = client.wait_for_diagnostics(&query_uri);
+    let diagnostics = client.wait_for_diagnostics(&query_uri, 1);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0]["severity"], 2);
     assert!(
@@ -612,12 +615,12 @@ fn diagnostics_flag_syntax_errors_and_unknown_references() {
 
     // Fixing the reference clears it.
     client.change(&query_uri, 2, "SELECT id FROM users");
-    let diagnostics = client.wait_for_diagnostics(&query_uri);
+    let diagnostics = client.wait_for_diagnostics(&query_uri, 2);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
     // A syntax problem is an error.
     client.change(&query_uri, 3, "SELECT FROM WHERE;");
-    let diagnostics = client.wait_for_diagnostics(&query_uri);
+    let diagnostics = client.wait_for_diagnostics(&query_uri, 3);
     assert!(
         diagnostics
             .iter()
@@ -684,7 +687,7 @@ fn rust_buffers_serve_sql_inside_query_macros() {
     // The SQL string spans host columns 26..46 on line 1.
     let source = "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users\");\n}\n";
     client.open_as(&main_uri, "rust", source);
-    let diagnostics = client.wait_for_diagnostics(&main_uri);
+    let diagnostics = client.wait_for_diagnostics(&main_uri, 1);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
     // Hover on `users` inside the macro string shows the table definition.
@@ -742,7 +745,7 @@ fn rust_buffers_serve_sql_inside_query_macros() {
     // An unknown table inside the macro is flagged at host coordinates.
     let source = "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM posts\");\n}\n";
     client.change(&main_uri, 2, source);
-    let diagnostics = client.wait_for_diagnostics(&main_uri);
+    let diagnostics = client.wait_for_diagnostics(&main_uri, 2);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(
         diagnostics[0]["range"]["start"]["line"], 1,
@@ -769,7 +772,7 @@ fn bind_parameter_mismatches_are_flagged_in_rust_buffers() {
     let source =
         "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users WHERE id = ?\");\n}\n";
     client.open_as(&main_uri, "rust", source);
-    let diagnostics = client.wait_for_diagnostics(&main_uri);
+    let diagnostics = client.wait_for_diagnostics(&main_uri, 1);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0]["severity"], 1, "{diagnostics:?}");
     assert!(
@@ -783,7 +786,7 @@ fn bind_parameter_mismatches_are_flagged_in_rust_buffers() {
     let source =
         "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users WHERE id = ?\", id);\n}\n";
     client.change(&main_uri, 2, source);
-    let diagnostics = client.wait_for_diagnostics(&main_uri);
+    let diagnostics = client.wait_for_diagnostics(&main_uri, 2);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
 }
 
