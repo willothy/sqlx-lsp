@@ -10,7 +10,14 @@ permissions:
   contents: write
 
 jobs:
+  # Nothing builds — let alone publishes — unless the checks pass.
+  checks:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yaml
+
   build:
+    needs: checks
     strategy:
       fail-fast: false
       matrix:
@@ -105,6 +112,7 @@ jobs:
           if-no-files-found: error
 
   build-vsix:
+    needs: checks
     runs-on: ubuntu-latest
     defaults:
       run:
