@@ -170,6 +170,25 @@ const FUNCTION_DOCS: &[(&str, &str)] = &[
     ("upper", "`upper(s)` — `s` folded to upper case."),
 ];
 
+/// The curated documentation for a keyword or keyword phrase, matched by
+/// its leading word (`GROUP BY` and `GROUP` both document `GROUP BY`).
+pub fn keyword_documentation(label: &str) -> Option<&'static str> {
+    let leading = label.split_whitespace().next()?.to_ascii_uppercase();
+    KEYWORD_DOCS
+        .iter()
+        .find(|(known, _)| *known == leading)
+        .map(|(_, doc)| *doc)
+}
+
+/// The curated documentation for a built-in function name.
+pub fn function_documentation(name: &str) -> Option<&'static str> {
+    let name = name.to_ascii_lowercase();
+    FUNCTION_DOCS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, doc)| *doc)
+}
+
 /// Builds hover content for the schema object referenced at `position`, or
 /// curated keyword/function documentation when the position holds no
 /// resolvable reference.
@@ -221,17 +240,11 @@ fn keyword_hover(document: &Document, parsed: &ParsedSql, position: Position) ->
         .get(index + 1)
         .is_some_and(|token| token.token == Token::LParen);
     let function_doc = follows_call
-        .then(|| {
-            let name = word.value.to_ascii_lowercase();
-            FUNCTION_DOCS.iter().find(|(known, _)| *known == name)
-        })
+        .then(|| function_documentation(&word.value))
         .flatten();
     let doc = match function_doc {
-        Some((_, doc)) => doc,
-        None if word.keyword != Keyword::NoKeyword => {
-            let name = word.value.to_ascii_uppercase();
-            KEYWORD_DOCS.iter().find(|(known, _)| *known == name)?.1
-        }
+        Some(doc) => doc,
+        None if word.keyword != Keyword::NoKeyword => keyword_documentation(&word.value)?,
         None => return None,
     };
 

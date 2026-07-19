@@ -14,6 +14,7 @@ use tower_lsp_server::ls_types::{
     MarkupKind, Position, Range, TextEdit,
 };
 
+use crate::analysis::hover;
 use crate::db::DatabaseKind;
 use crate::document::Document;
 use crate::parse::ParsedSql;
@@ -348,6 +349,7 @@ fn keyword_items(items: &mut Vec<CompletionItem>, kind: DatabaseKind, replace: R
     items.extend(keywords.map(|keyword| CompletionItem {
         label: (*keyword).to_owned(),
         kind: Some(CompletionItemKind::KEYWORD),
+        documentation: curated_documentation(hover::keyword_documentation(keyword)),
         sort_text: Some(format!("3{keyword}")),
         text_edit: accept_edit(replace, keyword),
         ..CompletionItem::default()
@@ -355,10 +357,21 @@ fn keyword_items(items: &mut Vec<CompletionItem>, kind: DatabaseKind, replace: R
     items.extend(FUNCTIONS.iter().map(|function| CompletionItem {
         label: (*function).to_owned(),
         kind: Some(CompletionItemKind::FUNCTION),
+        documentation: curated_documentation(hover::function_documentation(function)),
         sort_text: Some(format!("4{function}")),
         text_edit: accept_edit(replace, function),
         ..CompletionItem::default()
     }));
+}
+
+/// Wraps a curated documentation line for a completion item.
+fn curated_documentation(doc: Option<&str>) -> Option<Documentation> {
+    doc.map(|doc| {
+        Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc.to_owned(),
+        })
+    })
 }
 
 /// Computes completion items for `position` in `document`. `kind` selects
@@ -650,6 +663,33 @@ mod tests {
         };
         assert_eq!(edit.range.start, Position::new(0, 15));
         assert_eq!(edit.range.end, Position::new(0, 15));
+    }
+
+    #[test]
+    fn keyword_and_function_items_carry_curated_documentation() {
+        let document = Document::new(String::new());
+        let parsed = ParsedSql::parse(DatabaseKind::Sqlite.dialect(), document.text());
+        let items = completions(
+            &document,
+            &parsed,
+            Position::new(0, 0),
+            &schema(),
+            DatabaseKind::Sqlite,
+        );
+        let doc_of = |label: &str| {
+            let item = items
+                .iter()
+                .find(|item| item.label == label)
+                .unwrap_or_else(|| panic!("{label} offered"));
+            match &item.documentation {
+                Some(Documentation::MarkupContent(markup)) => Some(markup.value.as_str()),
+                _ => None,
+            }
+        };
+
+        // Multi-word keywords document their construct.
+        assert!(doc_of("GROUP BY").is_some_and(|doc| doc.contains("GROUP BY")));
+        assert!(doc_of("count").is_some_and(|doc| doc.contains("counts rows")));
     }
 
     #[test]
