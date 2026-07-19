@@ -476,6 +476,23 @@ fn references_and_rename_cover_closed_query_files() {
         })
         .count();
     assert_eq!(in_main, 2, "{locations:?}");
+
+    // Deleting a query file drops its entries from the index.
+    let get_sql = dir.path().join("queries").join("get.sql");
+    std::fs::remove_file(&get_sql).expect("delete query file");
+    client.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({ "changes": [{ "uri": file_uri(&get_sql), "type": 3 }] }),
+    );
+    client.wait_for_log("query index covers");
+    let locations = references(&mut client);
+    assert!(
+        locations
+            .iter()
+            .filter_map(|location| location["uri"].as_str())
+            .all(|uri| !uri.ends_with("get.sql")),
+        "{locations:?}"
+    );
 }
 
 #[test]

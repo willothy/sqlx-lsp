@@ -99,10 +99,44 @@ impl QueryDocument {
         }
     }
 
+    /// Reads one query source from disk: `None` for migration files (those
+    /// are cached separately), unreadable files, and Rust sources without
+    /// query macros. `path` must be absolute.
+    pub(crate) fn read(path: PathBuf, migration_dirs: &[PathBuf]) -> Option<QueryDocument> {
+        let is_sql = path.extension().is_some_and(|extension| extension == "sql");
+        if is_sql && migration_dirs.iter().any(|dir| path.starts_with(dir)) {
+            return None;
+        }
+        let uri = Uri::from_file_path(&path)?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        if is_sql {
+            Some(QueryDocument::Sql(SqlDocument {
+                path,
+                uri,
+                document: Document::new(text),
+                parsed: Mutex::new(None),
+            }))
+        } else {
+            // Cheap pre-filter before spending a tree-sitter parse.
+            if !text.contains("query") {
+                return None;
+            }
+            let extracted = embedded::EmbeddedSql::extract(&Document::new(text));
+            if extracted.regions.is_empty() {
+                return None;
+            }
+            Some(QueryDocument::Rust(RustQueryDocument {
+                path,
+                uri,
+                extracted,
+            }))
+        }
+    }
+
     /// Scans the workspace `roots` for query sources: `.sql` files outside
-    /// the migration directories (those are cached separately) and Rust
-    /// sources containing query macros. Unreadable files and Rust sources
-    /// without queries are dropped; the next scan retries them.
+    /// the migration directories and Rust sources containing query macros.
+    /// Unreadable files and Rust sources without queries are dropped; the
+    /// next scan retries them.
     pub(crate) fn scan(roots: &[PathBuf], migration_dirs: &[PathBuf]) -> Vec<QueryDocument> {
         let mut documents = Vec::new();
         let mut seen = BTreeSet::new();
@@ -111,38 +145,7 @@ impl QueryDocument {
                 if !seen.insert(path.clone()) {
                     continue;
                 }
-                let is_sql = path.extension().is_some_and(|extension| extension == "sql");
-                if is_sql && migration_dirs.iter().any(|dir| path.starts_with(dir)) {
-                    continue;
-                }
-                let Some(uri) = Uri::from_file_path(&path) else {
-                    continue;
-                };
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                if is_sql {
-                    documents.push(QueryDocument::Sql(SqlDocument {
-                        path,
-                        uri,
-                        document: Document::new(text),
-                        parsed: Mutex::new(None),
-                    }));
-                } else {
-                    // Cheap pre-filter before spending a tree-sitter parse.
-                    if !text.contains("query") {
-                        continue;
-                    }
-                    let extracted = embedded::EmbeddedSql::extract(&Document::new(text));
-                    if extracted.regions.is_empty() {
-                        continue;
-                    }
-                    documents.push(QueryDocument::Rust(RustQueryDocument {
-                        path,
-                        uri,
-                        extracted,
-                    }));
-                }
+                documents.extend(Self::read(path, migration_dirs));
             }
         }
         documents.sort_by(|a, b| a.path().cmp(b.path()));

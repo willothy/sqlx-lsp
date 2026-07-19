@@ -241,8 +241,11 @@ pub struct ServerState {
     /// pushes are suppressed then, so documents are not reported twice.
     pull_diagnostics_supported: AtomicBool,
     /// Wakes the query-index worker. Like reloads, refresh requests
-    /// coalesce: a burst of saves produces one rescan plus one follow-up.
+    /// coalesce: a burst of saves produces one refresh plus one follow-up.
     query_refresh_notify: Notify,
+    /// The files whose query-index entries the next refresh rebuilds,
+    /// drained by the worker in one batch.
+    pending_query_refresh: Mutex<HashSet<PathBuf>>,
 }
 
 impl Backend {
@@ -260,6 +263,7 @@ impl Backend {
             document_changes_supported: AtomicBool::new(false),
             pull_diagnostics_supported: AtomicBool::new(false),
             query_refresh_notify: Notify::new(),
+            pending_query_refresh: Mutex::new(HashSet::new()),
         });
 
         // Reloads run here rather than in notification handlers: a slow
@@ -273,9 +277,10 @@ impl Backend {
             }
         });
 
-        // Query-index rescans are much lighter than reloads (no cargo
-        // metadata, no introspection) but still walk the workspace, so they
-        // run on their own coalescing worker.
+        // Query-index refreshes are much lighter than reloads (no cargo
+        // metadata, no introspection, only the changed files re-read), but
+        // they still run on their own coalescing worker so save bursts
+        // produce one batch.
         let refresher = Arc::clone(&state);
         tokio::spawn(async move {
             loop {
@@ -289,22 +294,55 @@ impl Backend {
 }
 
 impl ServerState {
-    /// Schedules a query-index rescan on its worker and returns
-    /// immediately.
-    fn request_query_refresh(&self) {
+    /// Queues `uri`'s file for a query-index refresh and wakes the worker.
+    fn request_query_refresh(&self, uri: &Uri) {
+        let Some(path) = uri.to_file_path() else {
+            return;
+        };
+        self.pending_query_refresh
+            .lock()
+            .expect("refresh queue lock poisoned")
+            .insert(workspace::normalize(path.into_owned()));
         self.query_refresh_notify.notify_one();
     }
 
-    /// Rescans the workspace's query sources and swaps the cached index,
-    /// reporting the result the way reloads report theirs.
+    /// Rebuilds the query-index entries of the queued files — re-reading
+    /// changed files and dropping deleted ones — and reports the covered
+    /// count the way reloads report theirs. The full scan at load time
+    /// respects .gitignore; this path deliberately does not, since a file
+    /// the user just saved is worth indexing either way.
     async fn refresh_query_documents(&self) {
-        let (roots, migration_dirs) = {
-            let workspace = self.workspace.read().await;
-            (workspace.roots.clone(), workspace.migration_dirs.clone())
+        let changed = std::mem::take(
+            &mut *self
+                .pending_query_refresh
+                .lock()
+                .expect("refresh queue lock poisoned"),
+        );
+        if changed.is_empty() {
+            return;
+        }
+        let migration_dirs = self.workspace.read().await.migration_dirs.clone();
+        let replacements: Vec<(PathBuf, Option<workspace::QueryDocument>)> = changed
+            .into_iter()
+            .map(|path| {
+                let document = workspace::QueryDocument::read(path.clone(), &migration_dirs);
+                (path, document)
+            })
+            .collect();
+
+        let count = {
+            let mut workspace = self.workspace.write().await;
+            for (path, replacement) in replacements {
+                workspace
+                    .query_documents
+                    .retain(|existing| existing.path() != path);
+                workspace.query_documents.extend(replacement);
+            }
+            workspace
+                .query_documents
+                .sort_by(|a, b| a.path().cmp(b.path()));
+            workspace.query_documents.len()
         };
-        let documents = workspace::QueryDocument::scan(&roots, &migration_dirs);
-        let count = documents.len();
-        self.workspace.write().await.query_documents = documents;
         self.client
             .log_message(
                 MessageType::INFO,
@@ -970,7 +1008,7 @@ impl LanguageServer for Backend {
         if self.affects_workspace(&params.text_document.uri).await {
             self.request_reload();
         } else if is_query_source(&params.text_document.uri) {
-            self.request_query_refresh();
+            self.request_query_refresh(&params.text_document.uri);
         }
     }
 
@@ -1505,16 +1543,16 @@ impl LanguageServer for Backend {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         // A full reload also rebuilds the query index, so it subsumes any
         // refresh the same batch would request.
-        let mut refresh_queries = false;
         for change in &params.changes {
             if self.affects_workspace(&change.uri).await {
                 self.request_reload();
                 return;
             }
-            refresh_queries = refresh_queries || is_query_source(&change.uri);
         }
-        if refresh_queries {
-            self.request_query_refresh();
+        for change in &params.changes {
+            if is_query_source(&change.uri) {
+                self.request_query_refresh(&change.uri);
+            }
         }
     }
 }
