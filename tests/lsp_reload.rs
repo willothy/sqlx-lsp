@@ -268,6 +268,25 @@ impl LspClient {
         }
     }
 
+    /// Blocks until a `publishDiagnostics` notification for a URI ending in
+    /// `suffix` arrives and returns its diagnostics array. Symlinked temp
+    /// directories can respell the prefix, so exact URIs don't compare.
+    fn wait_for_diagnostics_ending(&mut self, suffix: &str) -> Vec<Value> {
+        loop {
+            let message = self.next_message();
+            if message["method"] == "textDocument/publishDiagnostics"
+                && message["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.ends_with(suffix))
+            {
+                return message["params"]["diagnostics"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+    }
+
     fn hover_text(&mut self, uri: &str, line: u32, character: u32) -> String {
         let result = self.request(
             "textDocument/hover",
@@ -900,6 +919,89 @@ fn utf8_position_encoding_negotiates_and_counts_bytes() {
     );
     assert_eq!(response["range"]["start"]["character"], 15, "{response:?}");
     assert_eq!(response["range"]["end"]["character"], 17, "{response:?}");
+}
+
+#[test]
+fn workspace_diagnostics_reach_closed_query_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    let main_rs = dir.path().join("src").join("main.rs");
+    std::fs::write(
+        &main_rs,
+        "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM posts\");\n}\n",
+    )
+    .expect("write main.rs");
+    let mut client = LspClient::start(dir.path());
+
+    // The closed file's unknown table arrives as a pushed diagnostic after
+    // the initial load.
+    let diagnostics = client.wait_for_diagnostics_ending("main.rs");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown table")),
+        "{diagnostics:?}"
+    );
+
+    // Fixing the file on disk clears the pushed report.
+    std::fs::write(
+        &main_rs,
+        "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM users\");\n}\n",
+    )
+    .expect("rewrite main.rs");
+    client.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({ "changes": [{ "uri": file_uri(&main_rs), "type": 2 }] }),
+    );
+    let diagnostics = client.wait_for_diagnostics_ending("main.rs");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn workspace_diagnostic_pull_covers_the_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("migrations")).expect("mkdir");
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("migrations").join("1_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .expect("write migration");
+    std::fs::write(
+        dir.path().join("src").join("main.rs"),
+        "fn main() {\n    let _ = sqlx::query!(\"SELECT id FROM posts\");\n}\n",
+    )
+    .expect("write main.rs");
+    let mut client = LspClient::start_with_capabilities(
+        dir.path(),
+        json!({ "textDocument": { "diagnostic": {} } }),
+    );
+    client.wait_for_load();
+
+    let report = client.request("workspace/diagnostic", json!({ "previousResultIds": [] }));
+    let items = report["items"].as_array().expect("items");
+    let for_main = items
+        .iter()
+        .find(|item| {
+            item["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("main.rs"))
+        })
+        .expect("main.rs reported");
+    assert_eq!(for_main["kind"], "full", "{for_main:?}");
+    assert!(
+        for_main["items"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown table")),
+        "{for_main:?}"
+    );
 }
 
 #[test]

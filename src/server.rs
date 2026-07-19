@@ -25,9 +25,10 @@ use tower_lsp_server::ls_types::{
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
     SymbolKind, TextDocumentEdit, TextDocumentPositionParams, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit,
-    Unregistration, Uri, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    Unregistration, Uri, WorkDoneProgressOptions, WorkspaceDiagnosticParams,
+    WorkspaceDiagnosticReport, WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport,
+    WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceFullDocumentDiagnosticReport,
+    WorkspaceServerCapabilities, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc};
 
@@ -246,6 +247,9 @@ pub struct ServerState {
     /// The files whose query-index entries the next refresh rebuilds,
     /// drained by the worker in one batch.
     pending_query_refresh: Mutex<HashSet<PathBuf>>,
+    /// The closed files currently holding pushed workspace diagnostics, so
+    /// the next sweep can clear the ones that became clean.
+    published_workspace_diagnostics: Mutex<HashSet<Uri>>,
 }
 
 impl Backend {
@@ -264,6 +268,7 @@ impl Backend {
             pull_diagnostics_supported: AtomicBool::new(false),
             query_refresh_notify: Notify::new(),
             pending_query_refresh: Mutex::new(HashSet::new()),
+            published_workspace_diagnostics: Mutex::new(HashSet::new()),
         });
 
         // Reloads run here rather than in notification handlers: a slow
@@ -349,6 +354,7 @@ impl ServerState {
                 format!("query index covers {count} file(s)"),
             )
             .await;
+        self.publish_workspace_diagnostics().await;
     }
 
     /// Schedules a workspace reload on the worker and returns immediately.
@@ -369,6 +375,82 @@ impl ServerState {
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+    }
+
+    /// Diagnostics for every indexed query file that is not open in the
+    /// editor, computed from the cached contents. Open buffers report
+    /// through document synchronization instead. Only files with findings
+    /// are returned.
+    fn closed_query_diagnostics(&self, workspace: &Workspace) -> Vec<(Uri, Vec<Diagnostic>)> {
+        let open_paths: HashSet<PathBuf> = self
+            .documents
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .key()
+                    .to_file_path()
+                    .map(|path| workspace::normalize(path.into_owned()))
+            })
+            .collect();
+
+        let mut reports = Vec::new();
+        for query in &workspace.query_documents {
+            if open_paths.contains(query.path()) {
+                continue;
+            }
+            let (uri, diagnostics) = match query {
+                workspace::QueryDocument::Sql(sql) => {
+                    let context = workspace.context_for(&sql.uri);
+                    let parsed = sql.parsed(context.kind);
+                    (
+                        sql.uri.clone(),
+                        diagnostics::diagnostics(&sql.document, &parsed, &context.schema),
+                    )
+                }
+                workspace::QueryDocument::Rust(rust) => {
+                    let context = workspace.context_for(&rust.uri);
+                    (
+                        rust.uri.clone(),
+                        embedded::diagnostics(&rust.extracted, &context.schema, context.kind),
+                    )
+                }
+            };
+            if !diagnostics.is_empty() {
+                reports.push((uri, diagnostics));
+            }
+        }
+        reports
+    }
+
+    /// Pushes diagnostics for closed query files after the schema or the
+    /// query index changed, clearing files that became clean since the last
+    /// sweep. Pulling clients request `workspace/diagnostic` instead.
+    async fn publish_workspace_diagnostics(&self) {
+        if self.pull_diagnostics_supported.load(Ordering::Relaxed) {
+            return;
+        }
+        let reports = {
+            let workspace = self.workspace.read().await;
+            self.closed_query_diagnostics(&workspace)
+        };
+        let cleared: Vec<Uri> = {
+            let mut published = self
+                .published_workspace_diagnostics
+                .lock()
+                .expect("published set lock poisoned");
+            let current: HashSet<Uri> = reports.iter().map(|(uri, _)| uri.clone()).collect();
+            let cleared = published.difference(&current).cloned().collect();
+            *published = current;
+            cleared
+        };
+        for (uri, diagnostics) in reports {
+            self.client
+                .publish_diagnostics(uri, diagnostics, None)
+                .await;
+        }
+        for uri in cleared {
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        }
     }
 
     /// The current diagnostics for `uri`, or `None` when it is not open.
@@ -707,9 +789,10 @@ impl ServerState {
             self.client.log_message(message_type, message).await;
         }
         self.register_watchers().await;
-        // The contexts changed, so every open document's diagnostics may
-        // have too.
+        // The contexts changed, so every document's diagnostics — open
+        // buffers and indexed closed files alike — may have too.
         self.publish_all_diagnostics().await;
+        self.publish_workspace_diagnostics().await;
 
         if let Some(progress) = progress {
             progress
@@ -906,7 +989,7 @@ impl LanguageServer for Backend {
                         // Migration edits change the schema other documents
                         // resolve against.
                         inter_file_dependencies: true,
-                        workspace_diagnostics: false,
+                        workspace_diagnostics: true,
                         work_done_progress_options: WorkDoneProgressOptions::default(),
                     },
                 )),
@@ -1208,6 +1291,56 @@ impl LanguageServer for Backend {
                     items,
                 },
             }),
+        ))
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> jsonrpc::Result<WorkspaceDiagnosticReportResult> {
+        let mut items = Vec::new();
+        {
+            let workspace = self.workspace.read().await;
+            for (uri, diagnostics) in self.closed_query_diagnostics(&workspace) {
+                items.push(WorkspaceDocumentDiagnosticReport::Full(
+                    WorkspaceFullDocumentDiagnosticReport {
+                        uri,
+                        version: None,
+                        full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                            result_id: None,
+                            items: diagnostics,
+                        },
+                    },
+                ));
+            }
+        }
+        // Open buffers report their live contents, with versions so the
+        // client can drop reports that raced an edit.
+        let open_uris: Vec<(Uri, i64)> = self
+            .documents
+            .iter()
+            .map(|entry| (entry.key().clone(), i64::from(entry.version)))
+            .collect();
+        for (uri, version) in open_uris {
+            let Some(diagnostics) = self.diagnostics_for(&uri).await else {
+                continue;
+            };
+            if diagnostics.is_empty() {
+                continue;
+            }
+            items.push(WorkspaceDocumentDiagnosticReport::Full(
+                WorkspaceFullDocumentDiagnosticReport {
+                    uri,
+                    version: Some(version),
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: diagnostics,
+                    },
+                },
+            ));
+        }
+        Ok(WorkspaceDiagnosticReportResult::Report(
+            WorkspaceDiagnosticReport { items },
         ))
     }
 
